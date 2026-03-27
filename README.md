@@ -1,1 +1,1 @@
-# flashmlx-turboquant-qwen3.5-27B
+# qwen3.5-35B3A-flash-mlx-turbo-quant

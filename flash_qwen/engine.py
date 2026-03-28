@@ -55,7 +55,9 @@ class SimpleTokenizer:
 class FlashInferenceEngine:
     def __init__(self, split_model_path: str, cache_size_mb: int = 6144,
                  original_model_path: Optional[str] = None,
-                 kv_bits: Optional[int] = None):
+                 kv_bits: Optional[int] = None,
+                 warm_experts: Optional[str] = None,
+                 use_mmap: bool = False):
         split_path = Path(split_model_path)
 
         with open(split_path / "config.json") as f:
@@ -68,8 +70,9 @@ class FlashInferenceEngine:
 
         # Initialize expert manager (Rust)
         expert_dir = str(split_path / "experts")
-        print(f"Initializing expert manager: cache={cache_size_mb}MB")
-        expert_manager = FlashExpertManager(expert_dir, cache_size_mb)
+        backend = "mmap" if use_mmap else "pread"
+        print(f"Initializing expert manager: cache={cache_size_mb}MB, backend={backend}")
+        expert_manager = FlashExpertManager(expert_dir, cache_size_mb, use_mmap=use_mmap)
         self.expert_manager = expert_manager
 
         # Build model
@@ -110,6 +113,25 @@ class FlashInferenceEngine:
         self.kv_bits = kv_bits
         if kv_bits is not None:
             print(f"TurboQuant KV cache: {kv_bits}-bit")
+
+        # Load warm set if available
+        warm_path = None
+        if warm_experts:
+            warm_path = Path(warm_experts)
+        else:
+            auto_path = split_path / "warm_experts.json"
+            if auto_path.exists():
+                warm_path = auto_path
+
+        if warm_path and warm_path.exists():
+            warm = json.loads(warm_path.read_text())
+            experts = [(l, e) for l, e in warm["experts"]]
+            print(f"Loading warm set: {len(experts)} experts...")
+            count, nbytes = expert_manager.preload_warm_set(experts)
+            locked = expert_manager.mlock_cache()
+            print(f"Warm set: {count} experts ({nbytes / (1024**3):.1f} GB), "
+                  f"mlocked {locked / (1024**3):.1f} GB, "
+                  f"coverage: {warm.get('coverage', 0):.0%}")
 
         # Load tokenizer
         tokenizer_path = original_model_path or str(split_path)

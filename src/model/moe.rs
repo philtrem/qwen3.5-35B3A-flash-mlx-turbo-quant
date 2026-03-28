@@ -67,10 +67,14 @@ impl SparseMoeBlock {
             .collect();
         perf.acc(&perf.routing_cpu, _t.elapsed());
 
-        // 4. Extract only the needed experts from mmap (~27 MB for 8 experts)
+        // 4. Extract only the needed experts (~27 MB for 8 experts)
         let _t = Instant::now();
         let experts = mem.extract_experts(self.layer_idx, &unique);
         perf.acc(&perf.extract_experts, _t.elapsed());
+
+        // Speculative prefetch: pre-warm next layer's pages via F_RDADVISE
+        // Non-blocking (~8μs), kernel reads asynchronously while GPU processes gather_qmm
+        mem.prefetch_next_layer(self.layer_idx, &unique);
 
         // 5. Remap flat indices from [0-255] to [0-num_unique)
         let remapped: Vec<i32> = flat_data.iter().map(|&idx| remap[&idx]).collect();

@@ -22,12 +22,15 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Split original model into resident weights + per-layer expert safetensors
+    /// Split original model into resident weights + per-layer expert files
     Split {
         #[arg(long)]
         model_path: PathBuf,
         #[arg(long)]
         output_path: PathBuf,
+        /// Expert file format: "ecb" (expert-centric binary) or "safetensors"
+        #[arg(long, default_value = "ecb")]
+        format: String,
     },
     /// Generate text from a prompt
     Generate {
@@ -55,9 +58,10 @@ fn main() -> anyhow::Result<()> {
         Command::Split {
             model_path,
             output_path,
+            format,
         } => {
-            eprintln!("Splitting model: {} → {}", model_path.display(), output_path.display());
-            splitter::split_model(&model_path, &output_path)?;
+            eprintln!("Splitting model: {} → {} (format: {})", model_path.display(), output_path.display(), format);
+            splitter::split_model(&model_path, &output_path, &format)?;
             eprintln!("Done.");
         }
 

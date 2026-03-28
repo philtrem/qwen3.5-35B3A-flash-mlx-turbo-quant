@@ -1,12 +1,16 @@
 use std::collections::HashSet;
 use std::fs::File;
 use std::os::unix::fs::FileExt;
+use std::os::unix::io::AsRawFd;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use memmap2::Mmap;
 use mlx_rs::{Array, Dtype};
+use rayon::prelude::*;
 use serde_json::Value;
+
+// ── Safetensors format structs ──────────────────────────────────────────────
 
 /// Per-tensor offset info parsed from a safetensors header.
 struct TensorInfo {
@@ -24,10 +28,41 @@ struct TensorInfo {
 struct LayerTensorOffsets {
     /// Start of tensor data: 8 + header_size
     data_start: usize,
-    /// The 9 expert tensors in order:
-    /// gate_proj.{weight,scales,biases}, up_proj.{weight,scales,biases}, down_proj.{weight,scales,biases}
+    /// The 9 expert tensors in order
     tensors: Vec<TensorInfo>,
 }
+
+// ── ECB format structs ──────────────────────────────────────────────────────
+
+/// Per-tensor descriptor parsed from ECB header.
+struct EcbTensorDesc {
+    /// Byte offset of this tensor within each expert's contiguous block
+    offset_within_expert: usize,
+    /// Bytes per expert for this tensor
+    stride: usize,
+    /// Per-expert shape (excludes expert dimension)
+    expert_shape: Vec<i32>,
+    /// MLX dtype
+    dtype: Dtype,
+}
+
+/// Parsed ECB layout for one layer file.
+struct EcbLayerInfo {
+    /// Byte offset where expert data begins (= header_size, page-aligned)
+    data_start: usize,
+    /// Total bytes per expert (sum of all tensor strides)
+    per_expert_stride: usize,
+    /// The 9 tensor descriptors
+    tensors: Vec<EcbTensorDesc>,
+}
+
+/// Which expert file format is in use.
+enum ExpertFormat {
+    Safetensors(Vec<LayerTensorOffsets>),
+    Ecb(Vec<EcbLayerInfo>),
+}
+
+// ── Shared types ────────────────────────────────────────────────────────────
 
 /// The 9 expert arrays extracted for a set of active experts.
 /// Each array has shape [num_experts, d1, d2].
@@ -43,19 +78,30 @@ pub struct ExpertSlice {
     pub down_biases: Array,
 }
 
-/// Manages expert safetensors files with direct pread() extraction.
+/// Manages expert files with direct pread() extraction.
 ///
-/// Instead of mmap demand-paging (which triggers ~55K page faults/token at ~20μs each),
-/// uses pread() syscalls that read entire expert strides in single I/O operations.
-/// mmap is kept only for warm set madvise prefetch.
+/// Supports both safetensors (72 preads/layer) and ECB (8 preads/layer) formats.
+/// ECB is auto-detected by probing for .ecb files; falls back to safetensors.
 pub struct ExpertMemoryManager {
     files: Vec<File>,       // for pread() extraction
     maps: Vec<Mmap>,        // for warm set madvise only
-    offsets: Vec<LayerTensorOffsets>,
+    format: ExpertFormat,
     warm_set: HashSet<(u32, u32)>,
     hits: AtomicUsize,
     misses: AtomicUsize,
 }
+
+// ── F_RDADVISE FFI (macOS) ──────────────────────────────────────────────────
+
+#[repr(C)]
+struct Radvisory {
+    ra_offset: libc::off_t,
+    ra_count: libc::c_int,
+}
+
+const F_RDADVISE: libc::c_int = 44;
+
+// ── Format parsing ──────────────────────────────────────────────────────────
 
 fn safetensors_dtype_to_mlx(dtype_str: &str) -> Dtype {
     match dtype_str {
@@ -66,6 +112,18 @@ fn safetensors_dtype_to_mlx(dtype_str: &str) -> Dtype {
         "I32" => Dtype::Int32,
         "U8" => Dtype::Uint8,
         _ => panic!("unsupported safetensors dtype: {}", dtype_str),
+    }
+}
+
+fn ecb_dtype_to_mlx(code: u32) -> Dtype {
+    match code {
+        0 => Dtype::Uint8,
+        1 => Dtype::Uint32,
+        2 => Dtype::Bfloat16,
+        3 => Dtype::Float16,
+        4 => Dtype::Float32,
+        5 => Dtype::Int32,
+        _ => panic!("unsupported ECB dtype code: {}", code),
     }
 }
 
@@ -95,7 +153,7 @@ fn parse_layer_offsets(mmap: &[u8]) -> anyhow::Result<LayerTensorOffsets> {
             .iter().map(|v| v.as_u64().unwrap() as usize).collect();
         let dtype_str = info["dtype"].as_str().unwrap();
         let dtype = safetensors_dtype_to_mlx(dtype_str);
-        let num_experts = shape[0]; // always 256
+        let num_experts = shape[0];
         let expert_shape: Vec<i32> = shape[1..].iter().map(|&s| s as i32).collect();
 
         let total_bytes = end - start;
@@ -112,30 +170,120 @@ fn parse_layer_offsets(mmap: &[u8]) -> anyhow::Result<LayerTensorOffsets> {
     Ok(LayerTensorOffsets { data_start, tensors })
 }
 
+/// Parse an ECB header (first 16384 bytes) to extract tensor descriptors.
+fn parse_ecb_header(file: &File) -> anyhow::Result<EcbLayerInfo> {
+    // Read the first 20 bytes to get fixed fields
+    let mut fixed = [0u8; 20];
+    file.read_exact_at(&mut fixed, 0)?;
+
+    let magic = &fixed[0..4];
+    if magic != b"ECB1" {
+        anyhow::bail!("not an ECB file (bad magic)");
+    }
+
+    let _num_experts = u32::from_le_bytes(fixed[4..8].try_into().unwrap());
+    let per_expert_stride = u32::from_le_bytes(fixed[8..12].try_into().unwrap()) as usize;
+    let num_tensors = u32::from_le_bytes(fixed[12..16].try_into().unwrap()) as usize;
+    let header_size = u32::from_le_bytes(fixed[16..20].try_into().unwrap()) as usize;
+
+    // Read remaining header bytes for tensor descriptors
+    let desc_bytes_needed = header_size - 20;
+    let mut desc_buf = vec![0u8; desc_bytes_needed];
+    file.read_exact_at(&mut desc_buf, 20)?;
+
+    let mut tensors = Vec::with_capacity(num_tensors);
+    let mut pos = 0usize;
+    let mut cumulative_offset = 0usize;
+
+    for _ in 0..num_tensors {
+        let stride = u32::from_le_bytes(desc_buf[pos..pos + 4].try_into().unwrap()) as usize;
+        pos += 4;
+        let dtype_code = u32::from_le_bytes(desc_buf[pos..pos + 4].try_into().unwrap());
+        pos += 4;
+        let ndim = u32::from_le_bytes(desc_buf[pos..pos + 4].try_into().unwrap()) as usize;
+        pos += 4;
+
+        let mut expert_shape = Vec::with_capacity(ndim);
+        for _ in 0..ndim {
+            let dim = u32::from_le_bytes(desc_buf[pos..pos + 4].try_into().unwrap()) as i32;
+            pos += 4;
+            expert_shape.push(dim);
+        }
+
+        tensors.push(EcbTensorDesc {
+            offset_within_expert: cumulative_offset,
+            stride,
+            expert_shape,
+            dtype: ecb_dtype_to_mlx(dtype_code),
+        });
+        cumulative_offset += stride;
+    }
+
+    Ok(EcbLayerInfo {
+        data_start: header_size,
+        per_expert_stride,
+        tensors,
+    })
+}
+
+// ── ExpertMemoryManager ─────────────────────────────────────────────────────
+
 impl ExpertMemoryManager {
-    /// Open expert safetensors files: mmap for headers + madvise, File handles for pread.
+    /// Open expert files: auto-detects ECB vs safetensors format.
+    /// mmap for headers + madvise, File handles for pread.
     pub fn new(expert_dir: &Path, num_layers: usize) -> anyhow::Result<Self> {
+        // Auto-detect format: try ECB first
+        let ecb_probe = expert_dir.join("layer_00_experts.ecb");
+        let use_ecb = ecb_probe.exists();
+
+        let ext = if use_ecb { "ecb" } else { "safetensors" };
+        eprintln!("  Expert format: {}", ext);
+
         let mut files = Vec::with_capacity(num_layers);
         let mut maps = Vec::with_capacity(num_layers);
-        let mut offsets = Vec::with_capacity(num_layers);
-        for i in 0..num_layers {
-            let path = expert_dir.join(format!("layer_{:02}_experts.safetensors", i));
-            let file = File::open(&path)?;
-            let mmap = unsafe { Mmap::map(&file)? };
-            let layer_offsets = parse_layer_offsets(&mmap)?;
-            offsets.push(layer_offsets);
-            maps.push(mmap);
-            // Reopen for pread (separate fd avoids any interaction with mmap)
-            files.push(File::open(&path)?);
+
+        if use_ecb {
+            let mut ecb_infos = Vec::with_capacity(num_layers);
+            for i in 0..num_layers {
+                let path = expert_dir.join(format!("layer_{:02}_experts.ecb", i));
+                let file = File::open(&path)?;
+                let info = parse_ecb_header(&file)?;
+                ecb_infos.push(info);
+                // mmap for warm set madvise
+                let mmap_file = File::open(&path)?;
+                let mmap = unsafe { Mmap::map(&mmap_file)? };
+                maps.push(mmap);
+                // Separate fd for pread
+                files.push(File::open(&path)?);
+            }
+            Ok(Self {
+                files,
+                maps,
+                format: ExpertFormat::Ecb(ecb_infos),
+                warm_set: HashSet::new(),
+                hits: AtomicUsize::new(0),
+                misses: AtomicUsize::new(0),
+            })
+        } else {
+            let mut st_offsets = Vec::with_capacity(num_layers);
+            for i in 0..num_layers {
+                let path = expert_dir.join(format!("layer_{:02}_experts.safetensors", i));
+                let file = File::open(&path)?;
+                let mmap = unsafe { Mmap::map(&file)? };
+                let layer_offsets = parse_layer_offsets(&mmap)?;
+                st_offsets.push(layer_offsets);
+                maps.push(mmap);
+                files.push(File::open(&path)?);
+            }
+            Ok(Self {
+                files,
+                maps,
+                format: ExpertFormat::Safetensors(st_offsets),
+                warm_set: HashSet::new(),
+                hits: AtomicUsize::new(0),
+                misses: AtomicUsize::new(0),
+            })
         }
-        Ok(Self {
-            files,
-            maps,
-            offsets,
-            warm_set: HashSet::new(),
-            hits: AtomicUsize::new(0),
-            misses: AtomicUsize::new(0),
-        })
     }
 
     /// Record the warm set for hit rate tracking.
@@ -156,10 +304,8 @@ impl ExpertMemoryManager {
     pub fn reset_cache_stats(&self) {}
     pub fn cache_size(&self) -> usize { 0 }
 
-    /// Extract specific experts from a layer using pread() syscalls.
-    /// Each expert stride is read in a single pread, avoiding the ~20μs-per-page
-    /// overhead of mmap demand-paging.
-    /// Tracks warm set hit/miss stats.
+    /// Extract specific experts from a layer.
+    /// Dispatches to ECB (8 parallel preads) or safetensors (72 preads) path.
     pub fn extract_experts(&self, layer: usize, expert_indices: &[i32]) -> ExpertSlice {
         // Track warm set hits
         for &eidx in expert_indices {
@@ -170,8 +316,71 @@ impl ExpertMemoryManager {
             }
         }
 
+        match &self.format {
+            ExpertFormat::Ecb(infos) => self.extract_experts_ecb(&infos[layer], layer, expert_indices),
+            ExpertFormat::Safetensors(offsets) => self.extract_experts_safetensors(&offsets[layer], layer, expert_indices),
+        }
+    }
+
+    /// ECB extract: 8 parallel preads (one per expert, ~3.375 MB each),
+    /// then scatter into 9 per-tensor arrays for gather_qmm.
+    fn extract_experts_ecb(&self, info: &EcbLayerInfo, layer: usize, expert_indices: &[i32]) -> ExpertSlice {
         let file = &self.files[layer];
-        let layer_offsets = &self.offsets[layer];
+        let stride = info.per_expert_stride;
+        let n = expert_indices.len();
+
+        // Parallel pread: one large contiguous read per expert
+        let expert_bufs: Vec<Vec<u8>> = expert_indices.par_iter()
+            .map(|&eidx| {
+                let mut buf = vec![0u8; stride];
+                let offset = info.data_start as u64 + eidx as u64 * stride as u64;
+                file.read_exact_at(&mut buf, offset).expect("pread failed");
+                buf
+            })
+            .collect();
+
+        // Scatter into 9 per-tensor Vecs
+        let mut arrays = Vec::with_capacity(9);
+        for tensor in &info.tensors {
+            let t_stride = tensor.stride;
+            let total = n * t_stride;
+            let mut tensor_buf = Vec::with_capacity(total);
+
+            for expert_buf in &expert_bufs {
+                tensor_buf.extend_from_slice(
+                    &expert_buf[tensor.offset_within_expert..tensor.offset_within_expert + t_stride]
+                );
+            }
+
+            let mut shape = vec![n as i32];
+            shape.extend_from_slice(&tensor.expert_shape);
+            let arr = unsafe {
+                Array::from_raw_data(
+                    tensor_buf.as_ptr() as *const std::ffi::c_void,
+                    &shape,
+                    tensor.dtype,
+                )
+            };
+            arrays.push(arr);
+        }
+
+        ExpertSlice {
+            gate_weight: arrays.remove(0),
+            gate_scales: arrays.remove(0),
+            gate_biases: arrays.remove(0),
+            up_weight: arrays.remove(0),
+            up_scales: arrays.remove(0),
+            up_biases: arrays.remove(0),
+            down_weight: arrays.remove(0),
+            down_scales: arrays.remove(0),
+            down_biases: arrays.remove(0),
+        }
+    }
+
+    /// Safetensors extract: 72 preads per layer (9 tensors × 8 experts).
+    /// Kept as fallback for backward compatibility.
+    fn extract_experts_safetensors(&self, layer_offsets: &LayerTensorOffsets, layer: usize, expert_indices: &[i32]) -> ExpertSlice {
+        let file = &self.files[layer];
         let n = expert_indices.len() as i32;
 
         let mut arrays = Vec::with_capacity(9);
@@ -216,6 +425,52 @@ impl ExpertMemoryManager {
         }
     }
 
+    /// Issue F_RDADVISE for the next layer's expected expert regions.
+    /// Non-blocking — kernel reads asynchronously while GPU processes current layer.
+    /// Exploits expert locality across adjacent layers.
+    pub fn prefetch_next_layer(&self, current_layer: usize, expert_indices: &[i32]) {
+        let next_layer = current_layer + 1;
+        if next_layer >= self.files.len() {
+            return;
+        }
+
+        let fd = self.files[next_layer].as_raw_fd();
+
+        match &self.format {
+            ExpertFormat::Ecb(infos) => {
+                let info = &infos[next_layer];
+                let stride = info.per_expert_stride;
+                for &eidx in expert_indices {
+                    let offset = info.data_start + eidx as usize * stride;
+                    let mut advice = Radvisory {
+                        ra_offset: offset as libc::off_t,
+                        ra_count: stride as libc::c_int,
+                    };
+                    unsafe {
+                        libc::fcntl(fd, F_RDADVISE, &mut advice);
+                    }
+                }
+            }
+            ExpertFormat::Safetensors(offsets) => {
+                let layer_offsets = &offsets[next_layer];
+                for &eidx in expert_indices {
+                    for tensor in &layer_offsets.tensors {
+                        let offset = layer_offsets.data_start
+                            + tensor.data_offset
+                            + eidx as usize * tensor.per_expert_stride;
+                        let mut advice = Radvisory {
+                            ra_offset: offset as libc::off_t,
+                            ra_count: tensor.per_expert_stride as libc::c_int,
+                        };
+                        unsafe {
+                            libc::fcntl(fd, F_RDADVISE, &mut advice);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// Prefetch warm set expert pages into kernel page cache via madvise.
     /// Returns total bytes advised.
     pub fn mlock_warm_set(&self, experts: &[(u32, u32)]) -> usize {
@@ -230,22 +485,41 @@ impl ExpertMemoryManager {
                 continue;
             }
             let mmap = &self.maps[layer];
-            let layer_offsets = &self.offsets[layer];
 
-            for tensor in &layer_offsets.tensors {
-                let abs_start = layer_offsets.data_start
-                    + tensor.data_offset
-                    + expert_idx * tensor.per_expert_stride;
-                let len = tensor.per_expert_stride;
+            match &self.format {
+                ExpertFormat::Ecb(infos) => {
+                    let info = &infos[layer];
+                    let abs_start = info.data_start + expert_idx * info.per_expert_stride;
+                    let len = info.per_expert_stride;
 
-                let aligned_start = abs_start & !(page_size - 1);
-                let aligned_len = (abs_start + len - aligned_start + page_size - 1)
-                    & !(page_size - 1);
+                    let aligned_start = abs_start & !(page_size - 1);
+                    let aligned_len = (abs_start + len - aligned_start + page_size - 1)
+                        & !(page_size - 1);
 
-                unsafe {
-                    let ptr = mmap.as_ptr().add(aligned_start);
-                    libc::madvise(ptr as *mut _, aligned_len, libc::MADV_WILLNEED);
-                    advised += aligned_len;
+                    unsafe {
+                        let ptr = mmap.as_ptr().add(aligned_start);
+                        libc::madvise(ptr as *mut _, aligned_len, libc::MADV_WILLNEED);
+                        advised += aligned_len;
+                    }
+                }
+                ExpertFormat::Safetensors(offsets) => {
+                    let layer_offsets = &offsets[layer];
+                    for tensor in &layer_offsets.tensors {
+                        let abs_start = layer_offsets.data_start
+                            + tensor.data_offset
+                            + expert_idx * tensor.per_expert_stride;
+                        let len = tensor.per_expert_stride;
+
+                        let aligned_start = abs_start & !(page_size - 1);
+                        let aligned_len = (abs_start + len - aligned_start + page_size - 1)
+                            & !(page_size - 1);
+
+                        unsafe {
+                            let ptr = mmap.as_ptr().add(aligned_start);
+                            libc::madvise(ptr as *mut _, aligned_len, libc::MADV_WILLNEED);
+                            advised += aligned_len;
+                        }
+                    }
                 }
             }
         }

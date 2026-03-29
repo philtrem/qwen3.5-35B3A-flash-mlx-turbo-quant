@@ -76,18 +76,28 @@ impl SparseMoeBlock {
         if USE_ZEROCOPY {
             // Zero-copy path: per-expert quantized_matmul from mmap'd Metal buffers
 
-            // 4. For each expert, create zero-copy arrays and compute matmuls
+            // 4. Pre-compute per-expert score weights on CPU (one eval, outside loop)
             let _t = Instant::now();
+            let scores_f32 = scores.as_dtype(mlx_rs::Dtype::Float32)?;
+            mlx_rs::transforms::eval(std::iter::once(&scores_f32))?;
+            let scores_data: &[f32] = scores_f32.as_slice();
 
-            // Build per-token score map: for each position, which experts and what weights?
-            // inds shape: [batch, top_k], scores shape: [batch, top_k]
-            // For decode (batch=1), inds is [1, 8] and flat_data is [8]
+            let mut weight_map: HashMap<i32, f32> = HashMap::new();
+            for (i, &idx) in flat_data.iter().enumerate() {
+                *weight_map.entry(idx).or_insert(0.0) += scores_data[i];
+            }
+
+            // 5. Build fully lazy computation graph — NO evals in this loop.
+            // MLX sees the complete graph before eval(h), enabling dispatch pipelining.
             let mut y_accum: Option<Array> = None;
 
-            for (ei, &eidx) in unique.iter().enumerate() {
+            for &eidx in &unique {
+                let total_weight = weight_map.get(&eidx).copied().unwrap_or(0.0);
+                if total_weight == 0.0 { continue; }
+
                 let expert = mem.extract_expert_zerocopy(self.layer_idx, eidx);
 
-                // Compute expert MLP: gate_proj → silu, up_proj, element-wise multiply, down_proj
+                // Expert MLP: gate_proj → silu, up_proj, element-wise multiply, down_proj
                 let gate_out = mlx_rs::ops::quantized_matmul(
                     x, &expert.gate_weight, &expert.gate_scales, &expert.gate_biases,
                     true, self.group_size, self.bits,
@@ -102,31 +112,12 @@ impl SparseMoeBlock {
                     true, self.group_size, self.bits,
                 )?;
 
-                // Weight by per-position routing scores for this expert.
-                // For each position, find the score assigned to this expert.
-                // flat_data has the expert indices per (batch, top_k) position.
-                // Build a mask/weight for positions that selected this expert.
-                let score_weights: Vec<f32> = flat_data.iter().enumerate()
-                    .map(|(_pos, &idx)| if idx == eidx { 1.0 } else { 0.0 })
-                    .collect();
-
-                // Get the actual scores for positions that match.
-                // scores is [1, top_k] in model dtype (bf16) — convert to f32 for accumulation.
-                let scores_f32 = scores.as_dtype(mlx_rs::Dtype::Float32)?;
-                mlx_rs::transforms::eval(std::iter::once(&scores_f32))?;
-                let scores_data: &[f32] = scores_f32.as_slice();
-                let total_weight: f32 = score_weights.iter().enumerate()
-                    .map(|(i, &w)| if w > 0.0 { scores_data[i] } else { 0.0 })
-                    .sum();
-
-                if total_weight > 0.0 {
-                    let scale = Array::from_f32(total_weight);
-                    let weighted = &down_out * &scale;
-                    y_accum = Some(match y_accum {
-                        None => weighted,
-                        Some(acc) => &acc + &weighted,
-                    });
-                }
+                let scale = Array::from_f32(total_weight);
+                let weighted = &down_out * &scale;
+                y_accum = Some(match y_accum {
+                    None => weighted,
+                    Some(acc) => &acc + &weighted,
+                });
             }
             perf.acc(&perf.extract_experts, _t.elapsed());
 

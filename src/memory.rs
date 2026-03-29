@@ -2,8 +2,11 @@ use std::collections::HashSet;
 use std::fs::File;
 use std::os::unix::fs::FileExt;
 use std::os::unix::io::AsRawFd;
+use std::os::unix::io::RawFd;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc;
+use std::thread;
 
 use memmap2::Mmap;
 use mlx_rs::{Array, Dtype};
@@ -110,6 +113,21 @@ pub struct SingleExpertTensors {
     pub down_biases: Array,
 }
 
+// ── Async I/O prefetch ─────────────────────────────────────────────────────
+
+/// Per-layer info passed to the I/O prefetch thread (all Send-safe).
+struct LayerIoInfo {
+    fd: RawFd,
+    data_start: usize,
+    per_expert_stride: usize,
+}
+
+/// Work item for the I/O prefetch thread.
+struct PrefetchWork {
+    layer: usize,
+    expert_indices: Vec<i32>,
+}
+
 /// Manages expert files with direct pread() extraction.
 ///
 /// Supports both safetensors (72 preads/layer) and ECB (8 preads/layer) formats.
@@ -121,6 +139,12 @@ pub struct ExpertMemoryManager {
     warm_set: HashSet<(u32, u32)>,
     hits: AtomicUsize,
     misses: AtomicUsize,
+    // Pre-allocated page-aligned buffer for hybrid pread+zerocopy path.
+    hybrid_buf_ptr: *mut u8,
+    hybrid_buf_layout: std::alloc::Layout,
+    // Async I/O prefetch thread — reads expert data to force pages into cache.
+    io_tx: Option<mpsc::Sender<Option<PrefetchWork>>>,
+    io_handle: Option<thread::JoinHandle<()>>,
 }
 
 // ── F_RDADVISE FFI (macOS) ──────────────────────────────────────────────────
@@ -309,6 +333,57 @@ impl ExpertMemoryManager {
                 maps.push(mmap);
                 files.push(pread_file);
             }
+            // Allocate page-aligned buffer for hybrid pread+zerocopy path
+            let max_stride = ecb_infos.iter().map(|i| i.per_expert_stride).max().unwrap_or(0);
+            let hybrid_buf_size = 16 * max_stride;
+            let hybrid_buf_layout = std::alloc::Layout::from_size_align(hybrid_buf_size, 16384)
+                .expect("invalid layout for hybrid buffer");
+            let hybrid_buf_ptr = unsafe { std::alloc::alloc(hybrid_buf_layout) };
+            if hybrid_buf_ptr.is_null() {
+                std::alloc::handle_alloc_error(hybrid_buf_layout);
+            }
+
+            // Spawn async I/O prefetch thread
+            let layer_infos: Vec<LayerIoInfo> = files.iter().zip(ecb_infos.iter())
+                .map(|(f, info)| LayerIoInfo {
+                    fd: f.as_raw_fd(),
+                    data_start: info.data_start,
+                    per_expert_stride: info.per_expert_stride,
+                })
+                .collect();
+
+            let (io_tx, io_rx) = mpsc::channel::<Option<PrefetchWork>>();
+
+            let io_handle = thread::Builder::new()
+                .name("expert-prefetch".into())
+                .spawn(move || {
+                    let max_stride = layer_infos.iter()
+                        .map(|i| i.per_expert_stride).max().unwrap_or(0);
+                    let mut buf = vec![0u8; max_stride];
+
+                    while let Ok(Some(work)) = io_rx.recv() {
+                        let info = &layer_infos[work.layer];
+                        for &eidx in &work.expert_indices {
+                            let offset = info.data_start as i64
+                                + eidx as i64 * info.per_expert_stride as i64;
+                            // pread into throwaway buffer — forces pages into
+                            // kernel page cache. On UMA, these same physical
+                            // pages back the mmap'd Metal buffers.
+                            unsafe {
+                                libc::pread(
+                                    info.fd,
+                                    buf.as_mut_ptr() as *mut libc::c_void,
+                                    info.per_expert_stride,
+                                    offset,
+                                );
+                            }
+                        }
+                    }
+                })
+                .expect("failed to spawn prefetch thread");
+
+            eprintln!("  I/O prefetch thread: started");
+
             Ok(Self {
                 files,
                 maps,
@@ -316,6 +391,10 @@ impl ExpertMemoryManager {
                 warm_set: HashSet::new(),
                 hits: AtomicUsize::new(0),
                 misses: AtomicUsize::new(0),
+                hybrid_buf_ptr,
+                hybrid_buf_layout,
+                io_tx: Some(io_tx),
+                io_handle: Some(io_handle),
             })
         } else {
             let mut st_offsets = Vec::with_capacity(num_layers);
@@ -335,6 +414,10 @@ impl ExpertMemoryManager {
                 warm_set: HashSet::new(),
                 hits: AtomicUsize::new(0),
                 misses: AtomicUsize::new(0),
+                hybrid_buf_ptr: std::ptr::null_mut(),
+                hybrid_buf_layout: std::alloc::Layout::from_size_align(1, 1).unwrap(),
+                io_tx: None,
+                io_handle: None,
             })
         }
     }
@@ -356,6 +439,20 @@ impl ExpertMemoryManager {
     pub fn take_cache_stats(&self) -> (u64, u64, f64) { (0, 0, 0.0) }
     pub fn reset_cache_stats(&self) {}
     pub fn cache_size(&self) -> usize { 0 }
+
+    /// Signal the background I/O thread to prefetch experts for a layer.
+    /// Non-blocking: sends work to the channel and returns immediately.
+    /// The I/O thread reads expert data via pread, populating the kernel
+    /// page cache. On UMA, these pages are the same physical memory that
+    /// backs the mmap'd Metal buffers — no copy to GPU needed.
+    pub fn prefetch_async(&self, layer: usize, expert_indices: &[i32]) {
+        if let Some(tx) = &self.io_tx {
+            let _ = tx.send(Some(PrefetchWork {
+                layer,
+                expert_indices: expert_indices.to_vec(),
+            }));
+        }
+    }
 
     /// Extract specific experts from a layer.
     /// Dispatches to ECB (8 parallel preads) or safetensors (72 preads) path.
@@ -592,6 +689,74 @@ impl ExpertMemoryManager {
         }
     }
 
+    /// Hybrid pread+zerocopy: parallel pread into pre-allocated buffer,
+    /// then wrap slices as zero-copy Metal arrays via newBufferWithBytesNoCopy.
+    ///
+    /// Eliminates page faults entirely: explicit I/O at high NVMe queue depth
+    /// (one pread per expert in parallel via rayon) followed by zero-copy GPU access.
+    ///
+    /// Safety: the hybrid buffer is reused across layers. Per-layer eval barriers
+    /// in model forward guarantee previous data is consumed before overwrite.
+    pub fn extract_experts_hybrid(&self, layer: usize, expert_indices: &[i32]) -> Vec<SingleExpertTensors> {
+        let info = match &self.format {
+            ExpertFormat::Ecb(infos) => &infos[layer],
+            ExpertFormat::Safetensors(_) => panic!("hybrid requires ECB format"),
+        };
+        let n = expert_indices.len();
+        let stride = info.per_expert_stride;
+        let total = n * stride;
+        assert!(
+            total <= self.hybrid_buf_layout.size(),
+            "hybrid buffer too small: need {} bytes for {} experts",
+            total, n
+        );
+
+        let file = &self.files[layer];
+        let buf_addr = self.hybrid_buf_ptr as usize;
+        let data_start = info.data_start;
+
+        // Parallel pread: one contiguous read per expert, high NVMe queue depth.
+        // Each thread writes to a non-overlapping region of the buffer.
+        expert_indices.par_iter().enumerate().for_each(|(i, &eidx)| {
+            let file_offset = data_start as u64 + eidx as u64 * stride as u64;
+            let dst = unsafe {
+                std::slice::from_raw_parts_mut((buf_addr + i * stride) as *mut u8, stride)
+            };
+            file.read_exact_at(dst, file_offset).expect("pread failed");
+        });
+
+        // Wrap buffer slices as zero-copy Metal arrays (no data copy, no page faults)
+        let buf_ptr = self.hybrid_buf_ptr;
+        expert_indices.iter().enumerate().map(|(i, _)| {
+            let expert_base = i * stride;
+            let mut arrays = Vec::with_capacity(9);
+            for tensor in &info.tensors {
+                let offset = expert_base + tensor.offset_within_expert;
+                let arr = unsafe {
+                    crate::ffi::array_from_mmap(
+                        buf_ptr,
+                        offset,
+                        tensor.stride,
+                        &tensor.expert_shape,
+                        tensor.dtype,
+                    )
+                };
+                arrays.push(arr);
+            }
+            SingleExpertTensors {
+                gate_weight: arrays.remove(0),
+                gate_scales: arrays.remove(0),
+                gate_biases: arrays.remove(0),
+                up_weight: arrays.remove(0),
+                up_scales: arrays.remove(0),
+                up_biases: arrays.remove(0),
+                down_weight: arrays.remove(0),
+                down_scales: arrays.remove(0),
+                down_biases: arrays.remove(0),
+            }
+        }).collect()
+    }
+
     /// Prefetch warm set expert pages into kernel page cache via madvise.
     /// Returns total bytes advised.
     pub fn mlock_warm_set(&self, experts: &[(u32, u32)]) -> usize {
@@ -625,5 +790,20 @@ impl ExpertMemoryManager {
         }
 
         advised
+    }
+}
+
+impl Drop for ExpertMemoryManager {
+    fn drop(&mut self) {
+        // Shut down I/O thread BEFORE files close (fds must remain valid).
+        if let Some(tx) = self.io_tx.take() {
+            let _ = tx.send(None); // signal shutdown
+        }
+        if let Some(handle) = self.io_handle.take() {
+            let _ = handle.join();
+        }
+        if !self.hybrid_buf_ptr.is_null() {
+            unsafe { std::alloc::dealloc(self.hybrid_buf_ptr, self.hybrid_buf_layout); }
+        }
     }
 }

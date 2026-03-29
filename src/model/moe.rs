@@ -70,6 +70,11 @@ impl SparseMoeBlock {
             .collect();
         perf.acc(&perf.routing_cpu, _t.elapsed());
 
+        // Signal I/O thread to start prefetching this layer's experts NOW.
+        // Non-blocking: returns immediately. The I/O thread reads pages into
+        // cache while we build the lazy graph (~26ms head start before eval).
+        mem.prefetch_async(self.layer_idx, &unique);
+
         if USE_ZEROCOPY {
             // Zero-copy path: per-expert quantized_matmul from mmap'd Metal buffers
 

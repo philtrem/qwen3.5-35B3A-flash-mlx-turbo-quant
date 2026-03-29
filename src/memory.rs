@@ -144,6 +144,7 @@ pub struct ExpertMemoryManager {
     hybrid_buf_layout: std::alloc::Layout,
     // Async I/O prefetch thread — reads expert data to force pages into cache.
     io_tx: Option<mpsc::Sender<Option<PrefetchWork>>>,
+    io_done_rx: Option<mpsc::Receiver<()>>,
     io_handle: Option<thread::JoinHandle<()>>,
 }
 
@@ -353,6 +354,7 @@ impl ExpertMemoryManager {
                 .collect();
 
             let (io_tx, io_rx) = mpsc::channel::<Option<PrefetchWork>>();
+            let (io_done_tx, io_done_rx) = mpsc::channel::<()>();
 
             let io_handle = thread::Builder::new()
                 .name("expert-prefetch".into())
@@ -366,9 +368,9 @@ impl ExpertMemoryManager {
                         for &eidx in &work.expert_indices {
                             let offset = info.data_start as i64
                                 + eidx as i64 * info.per_expert_stride as i64;
-                            // pread into throwaway buffer — forces pages into
-                            // kernel page cache. On UMA, these same physical
-                            // pages back the mmap'd Metal buffers.
+                            // pread into throwaway buffer — blocks until pages
+                            // are in kernel page cache. The blocking is the
+                            // guarantee: when pread returns, pages are resident.
                             unsafe {
                                 libc::pread(
                                     info.fd,
@@ -378,6 +380,7 @@ impl ExpertMemoryManager {
                                 );
                             }
                         }
+                        let _ = io_done_tx.send(());
                     }
                 })
                 .expect("failed to spawn prefetch thread");
@@ -394,6 +397,7 @@ impl ExpertMemoryManager {
                 hybrid_buf_ptr,
                 hybrid_buf_layout,
                 io_tx: Some(io_tx),
+                io_done_rx: Some(io_done_rx),
                 io_handle: Some(io_handle),
             })
         } else {
@@ -417,6 +421,7 @@ impl ExpertMemoryManager {
                 hybrid_buf_ptr: std::ptr::null_mut(),
                 hybrid_buf_layout: std::alloc::Layout::from_size_align(1, 1).unwrap(),
                 io_tx: None,
+                io_done_rx: None,
                 io_handle: None,
             })
         }
@@ -451,6 +456,16 @@ impl ExpertMemoryManager {
                 layer,
                 expert_indices: expert_indices.to_vec(),
             }));
+        }
+    }
+
+    /// Block until the I/O thread finishes the current prefetch request.
+    /// Call after graph build, before eval — ensures all expert pages are in
+    /// the page cache so the GPU runs fault-free. The GPU is better off idle
+    /// for ~3ms than faulting at 38% SSD efficiency for ~4.7ms.
+    pub fn wait_for_prefetch(&self) {
+        if let Some(rx) = &self.io_done_rx {
+            let _ = rx.recv();
         }
     }
 

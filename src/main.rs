@@ -97,7 +97,13 @@ fn main() -> anyhow::Result<()> {
             eprintln!("Mapping expert files from {}...", expert_dir.display());
             let mut mem_mgr = memory::ExpertMemoryManager::new(&expert_dir, args.num_hidden_layers)?;
 
-            // Prefetch warm set into page cache
+            // Load model FIRST (resident weights only — no expert arrays).
+            // This allocates 2.76 GB of Metal buffers. Loading before warm set
+            // prefetch ensures madvise pages aren't evicted by weight allocation.
+            eprintln!("Loading model from {}...", model_path.display());
+            let mut model = model::load_model(&model_path, &args)?;
+
+            // Prefetch warm set into page cache AFTER model loading
             let warm_path = warm_experts
                 .or_else(|| {
                     let auto = model_path.join("warm_experts.json");
@@ -126,10 +132,6 @@ fn main() -> anyhow::Result<()> {
                     advised as f64 / 1e9
                 );
             }
-
-            // Load model (resident weights only — no expert arrays)
-            eprintln!("Loading model from {}...", model_path.display());
-            let mut model = model::load_model(&model_path, &args)?;
 
             // Generate
             eprintln!("Engine ready.\n");

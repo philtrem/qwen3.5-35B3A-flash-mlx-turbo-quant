@@ -70,14 +70,19 @@ impl SparseMoeBlock {
             .collect();
         perf.acc(&perf.routing_cpu, _t.elapsed());
 
-        // Send cold experts first to I/O thread so it spends its lead time
-        // on high-value SSD reads (2.4 GB/s sequential), not on warm experts
-        // that return instantly from page cache.
-        let (_warm, cold) = mem.partition_warm_cold(self.layer_idx, &unique);
-        let cold_first: Vec<i32> = cold.iter()
-            .chain(unique.iter().filter(|e| !cold.contains(e)))
-            .copied().collect();
-        mem.prefetch_async(self.layer_idx, &cold_first);
+        // Decode only: send cold experts first to I/O thread, then wait
+        // after graph build so all pages are cached before GPU eval.
+        // Prefill skips this — faults are amortized over many positions.
+        let seq_len = x.dim(1);
+        let is_decode = seq_len == 1;
+
+        if is_decode {
+            let (_warm, cold) = mem.partition_warm_cold(self.layer_idx, &unique);
+            let cold_first: Vec<i32> = cold.iter()
+                .chain(unique.iter().filter(|e| !cold.contains(e)))
+                .copied().collect();
+            mem.prefetch_async(self.layer_idx, &cold_first);
+        }
 
         if USE_ZEROCOPY {
             // Zero-copy path: per-expert quantized_matmul from mmap'd Metal buffers
@@ -92,10 +97,6 @@ impl SparseMoeBlock {
             for (i, &idx) in flat_data.iter().enumerate() {
                 *weight_map.entry(idx).or_insert(0.0) += scores_data[i];
             }
-
-            // Determine if we need per-position weighting (prefill) or scalar (decode)
-            let seq_len = x.dim(1);
-            let is_decode = seq_len == 1;
 
             // 5. Build fully lazy computation graph — NO evals in this loop.
             let mut y_accum: Option<Array> = None;

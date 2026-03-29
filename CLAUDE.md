@@ -38,7 +38,7 @@ cargo build --release
 ### `src/`
 - **main.rs** — CLI (clap): split + generate subcommands
 - **model/** — Model/TextModel/DecoderLayer, GatedDeltaNet, Attention, SparseMoeBlock, RMSNorm, MLP
-- **memory.rs** — ExpertMemoryManager: pread + zero-copy extraction, warm set madvise, F_RDADVISE prefetch
+- **memory.rs** — ExpertMemoryManager: pread + zero-copy extraction, warm set madvise, async I/O prefetch thread, warm/cold partitioning
 - **engine.rs** — generate() loop + nucleus sampling
 - **perf.rs** — PerfStats: per-phase timing accumulator for decode analysis
 - **ffi.rs** — gather_qmm FFI + `array_from_mmap` zero-copy wrapper
@@ -58,21 +58,31 @@ cargo build --release
 
 ## Performance
 
-### Zero-copy path (USE_ZEROCOPY=true, current best):
-- **100 tokens**: 2.3 tok/s average decode, intervals 1.8-2.8 tok/s
-- Decode breakdown (428ms/tok): layer eval 349ms (81%), extract 30ms (7%), routing eval 50ms (12%)
-- Bottleneck: page fault latency during quantized_matmul (~37% of expert data demand-paged from SSD)
+### Zero-copy + async I/O thread (current best):
+- **100 tokens**: 3.5 tok/s average decode, intervals 3.0-4.1 tok/s (warm cache)
+- Decode breakdown (271ms/tok): layer eval 191ms (70%), extract 35ms (13%), routing eval 46ms (17%)
+- Bottleneck: page fault latency for cold experts during quantized_matmul
+- Async I/O thread pre-loads ~58% of cold experts via sequential pread (2.4 GB/s)
+- Remaining cold experts fault at ~917 MB/s effective (macOS readahead helps)
+
+### Without I/O thread (baseline zero-copy):
+- **100 tokens**: 2.1 tok/s decode
+- Decode breakdown (458ms/tok): layer eval 381ms (83%), extract 26ms (6%), routing eval 50ms (11%)
 
 ### pread path (USE_ZEROCOPY=false):
 - **50 tokens**: ~1.2 tok/s decode (verified coherent)
 - Decode breakdown (~773ms/tok): extract 661ms (86%), routing eval 52ms, layer eval 37ms, sort eval 23ms
-- Bottleneck: SSD I/O for ~60% page cache misses
+
+### SSD benchmarks (M4 Mac Mini base):
+- Sequential read (cold): 2.4 GB/s
+- Random 16 KB read (cold): 153 MB/s (107μs per read)
+- Gap: 16× — converting page faults to sequential pread is the key optimization
 
 ### General:
 - No swap storms. Peak expert memory ~27 MB per layer.
 - Warm set hit rate: ~63% (static, from 14-prompt profiling run)
 - Expert reuse: 46% token-to-token overlap, 62% at k=5 window
-- Cross-token predictor was removed (see memory for restoration details) — it gave ~15% speedup (2.7→2.3 tok/s) via F_RDADVISE between tokens, but overlaps heavily with warm set
+- **Warm set page residency: only ~6.2 GB of 10.1 GB actually in page cache** (madvise is unreliable)
 
 ## Key gotchas
 
@@ -88,8 +98,11 @@ cargo build --release
 ### Memory / UMA
 - **Do NOT load all expert files via load_safetensors** — causes 25+ GB swap on 16 GB
 - On-demand expert extraction via pread() is the correct approach (~27 MB per layer, not 864 MB)
-- pread() is 3.6× faster than mmap demand-paging (page fault overhead: ~20μs/page × 55K pages/tok)
-- madvise(MADV_WILLNEED) for warm set prefetch via mmap (kept alongside pread File handles), NOT mlock
+- pread() is 3.6× faster than mmap demand-paging (page fault overhead: ~107μs/page for cold 16 KB random reads)
+- madvise(MADV_WILLNEED) for warm set prefetch via mmap — **unreliable**: only ~60% of advised pages are actually resident. mlock fixes this but breaks inference at 10 GB (too much wired memory for Metal)
+- **Async I/O prefetch thread** converts cold-expert page faults (153 MB/s) to sequential pread (2.4 GB/s) — 67% speedup. Cold-first ordering maximizes lead time. Fire-and-forget (non-blocking) is correct; halting GPU to wait is WORSE (page faults overlap with GPU compute naturally)
+- madvise from I/O thread does NOT work — it returns before pages are loaded (non-blocking hint). pread blocks until pages are resident, which IS the guarantee we need
+- Speculative multi-layer lookahead from I/O thread HURTS — SSD contention between speculative reads and actual page faults
 - Per-layer eval ensures expert arrays are freed after each layer (peak ~27 MB, not cumulative)
 - Expert LRU caching (both MLX Array and raw byte) does NOT help — working set (~3200 experts) >> cache size (960) on 16 GB; cache just displaces page cache
 - LZ4/Zstd compression does NOT help — decompression (4 GB/s) can't outrun SSD (2.5 GB/s) at realistic ratios

@@ -368,27 +368,29 @@ impl ExpertMemoryManager {
         let stride = info.per_expert_stride;
         let n = expert_indices.len();
 
-        // Parallel pread: one large contiguous read per expert
+        // Parallel pread: one large contiguous read per expert.
+        // Uninitialized buffers — pread overwrites every byte.
         let expert_bufs: Vec<Vec<u8>> = expert_indices.par_iter()
             .map(|&eidx| {
-                let mut buf = vec![0u8; stride];
+                let mut buf = Vec::with_capacity(stride);
+                unsafe { buf.set_len(stride); }
                 let offset = info.data_start as u64 + eidx as u64 * stride as u64;
                 file.read_exact_at(&mut buf, offset).expect("pread failed");
                 buf
             })
             .collect();
 
-        // Scatter into 9 per-tensor Vecs
+        // Scatter into 9 per-tensor buffers via direct indexing (no extend_from_slice)
         let mut arrays = Vec::with_capacity(9);
         for tensor in &info.tensors {
             let t_stride = tensor.stride;
             let total = n * t_stride;
             let mut tensor_buf = Vec::with_capacity(total);
+            unsafe { tensor_buf.set_len(total); }
 
-            for expert_buf in &expert_bufs {
-                tensor_buf.extend_from_slice(
-                    &expert_buf[tensor.offset_within_expert..tensor.offset_within_expert + t_stride]
-                );
+            for (i, expert_buf) in expert_bufs.iter().enumerate() {
+                tensor_buf[i * t_stride..(i + 1) * t_stride]
+                    .copy_from_slice(&expert_buf[tensor.offset_within_expert..tensor.offset_within_expert + t_stride]);
             }
 
             let mut shape = vec![n as i32];

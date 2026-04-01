@@ -48,9 +48,12 @@ enum Command {
         top_p: f32,
         #[arg(long)]
         warm_experts: Option<PathBuf>,
-        /// TurboQuant KV cache quantization bits (2, 3, or 4). Omit for bf16.
-        #[arg(long)]
+        /// TurboQuant KV cache quantization bits (2, 3, or 4). Default: 3.
+        #[arg(long, default_value = "3")]
         kv_quant_bits: Option<u8>,
+        /// Disable TurboQuant KV cache quantization (use plain bf16).
+        #[arg(long)]
+        no_kv_quant: bool,
         /// Disable speculative F_RDADVISE prefetch for next-layer predicted experts.
         #[arg(long)]
         no_speculate: bool,
@@ -83,9 +86,11 @@ fn main() -> anyhow::Result<()> {
             top_p,
             warm_experts,
             kv_quant_bits,
+            no_kv_quant,
             no_speculate,
             warm_set,
         } => {
+            let kv_quant_bits = if no_kv_quant { None } else { kv_quant_bits };
             // Load config
             let config_path = model_path.join("config.json");
             let (args, quant) = config::TextModelArgs::from_config_file(&config_path)?;

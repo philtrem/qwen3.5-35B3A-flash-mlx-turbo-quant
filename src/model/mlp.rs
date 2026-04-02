@@ -39,3 +39,19 @@ impl MLP {
         self.down_proj.forward(&h)
     }
 }
+
+/// Gemma4 MLP: GELU_approx(gate_proj(x)) * up_proj(x) → down_proj
+pub struct GeLUMLP {
+    pub gate_proj: QuantizedLinear,
+    pub up_proj: QuantizedLinear,
+    pub down_proj: QuantizedLinear,
+}
+
+impl GeLUMLP {
+    pub fn forward(&self, x: &Array) -> Result<Array, Exception> {
+        let gate = mlx_rs::nn::gelu_approximate(&self.gate_proj.forward(x)?)?;
+        let up = self.up_proj.forward(x)?;
+        let h = &gate * &up;
+        self.down_proj.forward(&h)
+    }
+}

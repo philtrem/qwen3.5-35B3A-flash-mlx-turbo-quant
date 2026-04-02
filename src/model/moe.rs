@@ -376,3 +376,207 @@ impl SparseMoeBlock {
         }
     }
 }
+
+/// Gemma4 MoE block: different router (norm + scale + per_expert_scale), GELU activation.
+/// No shared expert — dense MLP is handled at the layer level.
+pub struct Gemma4MoeBlock {
+    /// Router projection (hidden_size → num_experts)
+    pub router_proj: QuantizedLinear,
+    /// Per-dimension learned scale applied after norm
+    pub router_scale: Array,
+    /// Per-expert output scale
+    pub per_expert_scale: Array,
+    /// 1/sqrt(hidden_size) for router normalization
+    pub root_size: f32,
+    pub rms_norm_eps: f32,
+    pub top_k: usize,
+    pub layer_idx: usize,
+    pub bits: i32,
+    pub group_size: i32,
+}
+
+impl Gemma4MoeBlock {
+    pub fn forward(
+        &self,
+        x: &Array,
+        mem: &ExpertMemoryManager,
+        perf: &PerfStats,
+        next_layer_gate: Option<(&QuantizedLinear, &RMSNorm)>,
+        tp: Option<&RefCell<TransitionProfiler>>,
+    ) -> Result<Array, Exception> {
+        let k = self.top_k as i32;
+
+        // 1. Router: RMSNormNoScale → scale → proj → softmax → top-k → renormalize → per_expert_scale
+        let normed = self.rms_norm_no_scale(x)?;
+        let root_size = Array::from_f32(self.root_size).as_dtype(x.dtype())?;
+        let scaled = &normed * &root_size;
+        let router_scale = self.router_scale.as_dtype(x.dtype())?;
+        let scaled = &scaled * &router_scale;
+        let expert_scores = self.router_proj.forward(&scaled)?;
+        let router_probs = mlx_rs::ops::softmax_axis(&expert_scores, -1, None)?;
+
+        let neg_scores = mlx_rs::ops::negative(&expert_scores)?;
+        let inds_full = mlx_rs::ops::argpartition_axis(&neg_scores, k - 1, -1)?;
+        // Take top-k (first k elements after argpartition of negated scores)
+        let parts = mlx_rs::ops::split_sections(&inds_full, &[k], Some(-1))?;
+        let inds = parts[0].as_dtype(mlx_rs::Dtype::Int32)?;
+
+        let scores = mlx_rs::ops::indexing::take_along_axis(&router_probs, &inds, Some(-1))?;
+        // Renormalize
+        let s = mlx_rs::ops::sum_axis(&scores, -1, Some(true))?;
+        let scores = &scores / &s;
+        // Apply per-expert scale
+        let flat_idx_for_scale = inds.reshape(&[-1])?;
+        let per_exp_scales = mlx_rs::ops::indexing::take_axis(&self.per_expert_scale, &flat_idx_for_scale, 0)?;
+        let per_exp_scales = per_exp_scales.reshape(inds.shape())?;
+        let per_exp_scales_typed = per_exp_scales.as_dtype(scores.dtype())?;
+        let scores = &scores * &per_exp_scales_typed;
+
+        // 2. Compute routing indices (lazy graph)
+        let flat_idx = inds.reshape(&[-1])?;
+        let scores_f32 = scores.as_dtype(mlx_rs::Dtype::Float32)?;
+
+        let seq_len = x.dim(1);
+        let is_decode = seq_len == 1;
+
+        // Speculative prediction for next layer
+        let pred_flat = if is_decode {
+            if let Some((next_gate, next_ln)) = next_layer_gate {
+                let pred_k = 12i32;
+                let pred_normed = next_ln.forward(x)?;
+                let pred_logits = next_gate.forward(&pred_normed)?;
+                let pred_inds = mlx_rs::ops::argpartition_axis(&pred_logits, -pred_k, -1)?;
+                let pred_num = pred_inds.dim(pred_inds.ndim() as i32 - 1);
+                let pred_split = pred_num - pred_k;
+                let pred_parts =
+                    mlx_rs::ops::split_sections(&pred_inds, &[pred_split], Some(-1))?;
+                let pred_topk = pred_parts[1].as_dtype(mlx_rs::Dtype::Int32)?;
+                Some(pred_topk.reshape(&[-1])?)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        // GPU sync
+        let _t = Instant::now();
+        if let Some(ref pf) = pred_flat {
+            mlx_rs::transforms::eval([&flat_idx, &scores_f32, pf])?;
+        } else {
+            mlx_rs::transforms::eval([&flat_idx, &scores_f32])?;
+        }
+        perf.acc(&perf.moe_routing_eval, _t.elapsed());
+        let flat_data: &[i32] = flat_idx.as_slice();
+        let scores_data: &[f32] = scores_f32.as_slice();
+
+        // Find unique experts
+        let _t = Instant::now();
+        let mut unique: Vec<i32> = flat_data.to_vec();
+        unique.sort();
+        unique.dedup();
+
+        // Reactive prefetch
+        if is_decode && !*NOREACTIVE.get_or_init(|| std::env::var("NOREACTIVE").is_ok()) {
+            let group = mem.prefetch_gcd_reactive(self.layer_idx, &unique);
+            mem.wait_prefetch_group(group);
+        }
+
+        // Pre-compute per-expert score weights
+        let mut weight_map: HashMap<i32, f32> = HashMap::new();
+        for (i, &idx) in flat_data.iter().enumerate() {
+            *weight_map.entry(idx).or_insert(0.0) += scores_data[i];
+        }
+        perf.acc(&perf.routing_cpu, _t.elapsed());
+
+        // Check pending prediction
+        if let Some(tp_ref) = tp {
+            let mut tp_mut = tp_ref.borrow_mut();
+            if let Some((pred_layer, predicted)) = tp_mut.pending_prediction.take() {
+                if pred_layer == self.layer_idx {
+                    tp_mut.record_gate_reuse(self.layer_idx, &predicted, &unique);
+                }
+            }
+        }
+
+        // Record prediction for pipeline prefetch
+        if let Some(ref pf) = pred_flat {
+            let pred_data: &[i32] = pf.as_slice();
+            let mut pred_unique: Vec<i32> = pred_data.to_vec();
+            pred_unique.sort();
+            pred_unique.dedup();
+            let next_layer = self.layer_idx + 1;
+            if let Some(tp_ref) = tp {
+                tp_ref.borrow_mut().pending_prediction = Some((next_layer, pred_unique));
+            }
+        }
+
+        // Zero-copy expert evaluation with GELU activation
+        let _t = Instant::now();
+        let experts: Vec<SingleExpertTensors> = {
+            let mut v = Vec::with_capacity(unique.len());
+            for &eidx in &unique {
+                v.push(mem.extract_expert_zerocopy(self.layer_idx, eidx));
+            }
+            v
+        };
+
+        let mut y_accum: Option<Array> = None;
+
+        for (idx, &eidx) in unique.iter().enumerate() {
+            let expert = &experts[idx];
+
+            // Expert MLP: GELU(gate_proj(x)) * up_proj(x) → down_proj
+            let gate_out = mlx_rs::ops::quantized_matmul(
+                x, &expert.gate_weight, &expert.gate_scales, &expert.gate_biases,
+                true, self.group_size, self.bits,
+            )?;
+            let up_out = mlx_rs::ops::quantized_matmul(
+                x, &expert.up_weight, &expert.up_scales, &expert.up_biases,
+                true, self.group_size, self.bits,
+            )?;
+            // GELU instead of SiLU
+            let act = &mlx_rs::nn::gelu_approximate(&gate_out)? * &up_out;
+            let down_out = mlx_rs::ops::quantized_matmul(
+                &act, &expert.down_weight, &expert.down_scales, &expert.down_biases,
+                true, self.group_size, self.bits,
+            )?;
+
+            if is_decode {
+                let total_weight = weight_map.get(&eidx).copied().unwrap_or(0.0);
+                if total_weight == 0.0 {
+                    continue;
+                }
+                let scale = Array::from_f32(total_weight).as_dtype(x.dtype())?;
+                let weighted = &down_out * &scale;
+                y_accum = Some(match y_accum {
+                    None => weighted,
+                    Some(acc) => &acc + &weighted,
+                });
+            } else {
+                let eidx_arr = Array::from_int(eidx);
+                let mask = inds.eq(&eidx_arr)?;
+                let mask_f = mask.as_dtype(scores.dtype())?;
+                let per_pos_weight =
+                    mlx_rs::ops::sum_axis(&(&scores * &mask_f), -1, Some(true))?;
+                let weighted = &down_out * &per_pos_weight;
+                y_accum = Some(match y_accum {
+                    None => weighted,
+                    Some(acc) => &acc + &weighted,
+                });
+            }
+        }
+        perf.acc(&perf.extract_experts, _t.elapsed());
+
+        Ok(y_accum.unwrap_or_else(|| Array::zeros::<f32>(&x.shape()).unwrap()))
+    }
+
+    /// RMSNorm without learnable scale (inline for router)
+    fn rms_norm_no_scale(&self, x: &Array) -> Result<Array, Exception> {
+        let x2 = x * x;
+        let mean = mlx_rs::ops::mean_axes(&x2, &[-1], Some(true))?;
+        let eps = Array::from_f32(self.rms_norm_eps);
+        let rms = mlx_rs::ops::rsqrt(&(&mean + &eps))?;
+        Ok(x * &rms)
+    }
+}

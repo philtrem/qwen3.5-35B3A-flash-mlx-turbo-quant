@@ -10,7 +10,13 @@ Detailed implementation history, decisions, and performance data are in the auto
 
 ## What this is
 
-Flash-loading inference engine for Qwen3.5-35B-A3B on Mac M4 base 16GB. All-Rust single binary via `mlx-rs`, on-demand expert loading via GCD prefetch + zero-copy mmap Metal buffers.
+Flash-loading inference engine for sparse MoE models on Mac M4 base 16GB. All-Rust single binary via `mlx-rs`, on-demand expert loading via GCD prefetch + zero-copy mmap Metal buffers.
+
+**Supported models:**
+- **Gemma 4 26B-A4B** (default) — `gemma4` architecture, 30 layers, 128 experts, top_k=8
+- **Qwen 3.5 35B-A3B** — `qwen3_5_moe` architecture, 40 layers, 256 experts, top_k=8
+
+Model type is auto-detected from config.json (`layer_types` field present → Gemma4, otherwise Qwen).
 
 ## Build
 
@@ -22,12 +28,16 @@ cargo build --release
 
 ```bash
 # Split model (one-time, creates ECB format)
-./target/release/flash-qwen split \
-  --model-path /Users/philtrem/.lmstudio/models/mlx-community/Qwen3.5-35B-A3B-4bit \
-  --output-path ./split_model_st
+./target/release/flash-moe split \
+  --model-path /path/to/mlx-community/model \
+  --output-path ./split_output
 
-# Generate (default: GCD speculative + reactive prefetch, no warm set)
-./target/release/flash-qwen generate \
+# Generate (defaults to ./split_gemma4 model path)
+./target/release/flash-moe generate \
+  --prompt "Hello" --max-tokens 256
+
+# Qwen model (must specify paths)
+./target/release/flash-moe generate \
   --model-path ./split_model_st \
   --tokenizer-path /Users/philtrem/.lmstudio/models/mlx-community/Qwen3.5-35B-A3B-4bit \
   --prompt "Hello" --max-tokens 256
@@ -36,19 +46,27 @@ cargo build --release
 #   --no-speculate    Disable speculative prefetch for predicted experts
 #   --warm-set        Load warm set at startup (preads frequent experts into page cache)
 #   --kv-quant-bits 3 TurboQuant KV cache (3-bit, ~30% slower)
+#   --no-kv-quant     Disable KV cache quantization (plain bf16)
 ```
 
 ## Architecture
 
 ### `src/`
-- **main.rs** — CLI (clap): split + generate subcommands. Reads quant config from config.json.
-- **model/** — Model/TextModel/DecoderLayer, GatedDeltaNet, Attention, SparseMoeBlock, RMSNorm, MLP
+- **main.rs** — CLI (clap): split + generate subcommands. Reads quant config from config.json. Default model: `./split_gemma4`.
+- **config.rs** — `TextModelArgs` with `ModelType` enum (Qwen/Gemma4). Auto-detects from config.json. Handles both naming conventions.
+- **model/** — Model/TextModel/DecoderLayer with MoeVariant (Qwen/Gemma4), plus:
+  - **attention.rs** — Qwen full attention (output gating, partial RoPE)
+  - **gemma4_attention.rs** — Gemma4 attention (no gating, K==V for full-attn, v_norm, scale=1.0, per-layer RoPE/head_dim)
+  - **gated_delta.rs** — Qwen GatedDeltaNet linear attention
+  - **moe.rs** — SparseMoeBlock (Qwen: shared expert, SiLU) + Gemma4MoeBlock (router with norm+scale+per_expert_scale, GELU)
+  - **mlp.rs** — QuantizedLinear, MLP (SiLU), GeLUMLP (Gemma4)
+  - **norm.rs** — RMSNorm, RMSNormGated, RMSNormNoScale (Gemma4 v_norm)
 - **memory.rs** — ExpertMemoryManager: GCD prefetch (speculative/reactive with QoS + cancel), zero-copy mmap extraction, warm set pread, F_RDADVISE
 - **engine.rs** — generate() loop + nucleus sampling
 - **perf.rs** — PerfStats: per-phase timing accumulator (routing eval, layer eval, GPU wait, extract, routing CPU)
 - **ffi.rs** — gather_qmm FFI + `array_from_mmap` zero-copy wrapper
 - **ffi_zerocopy.cpp** — C++ shim: MLX array from mmap via Metal `newBufferWithBytesNoCopy`
-- **splitter.rs** — model splitter (original → resident + per-layer expert ECB)
+- **splitter.rs** — model splitter (original → resident + per-layer expert ECB). Auto-detects Qwen (switch_mlp) vs Gemma4 (experts.gate_up_proj) layout. Unfuses Gemma4 gate_up_proj during ECB writing.
 - **build.rs** — compiles ffi_zerocopy.cpp with MLX C++ headers
 
 ### I/O strategy (current default, USE_ZEROCOPY=true)
@@ -57,23 +75,54 @@ cargo build --release
 - **Warm set pread at startup** (opt-in, `--warm-set`): `mlock_warm_set()` uses parallel pread to guarantee warm expert pages are resident.
 - Per-layer eval via `async_eval` + `eval` separates GPU submission from wait time in perf stats.
 
-### Model
-- Model type is `qwen3_5_moe` mapping to `mlx_lm.models.qwen3_5` (NOT `qwen3_next`)
-- 40 layers: 30 linear-attention (GatedDeltaNet/ArraysCache) + 10 full-attention (Attention/KVCache), every 4th layer is full-attention
-- Quantization read from config.json (bits + group_size). Supports 4-bit and 8-bit.
-- Expert dimensions: hidden=2048, intermediate=512, 256 experts/layer, top_k=8
-- **4-bit (group_size=64)**: per_expert_stride ~1.69 MB, ECB file ~453 MB/layer, 8 active = ~13.5 MB/layer
-- **8-bit (group_size=32)**: per_expert_stride 3.38 MB, ECB file 906 MB/layer, 8 active = 27 MB/layer
-- 12 CPU threads available (M4)
+### Models
 
-### Current model: 4-bit
-- Path: `/Users/philtrem/.lmstudio/models/mlx-community/Qwen3.5-35B-A3B-4bit`
+#### Gemma 4 26B-A4B (default)
+- Architecture: `gemma4` / `gemma4_text`
+- 30 layers, all with MoE + dense MLP in parallel
+- Attention: 24 sliding (head_dim=256, kv_heads=8, rope_theta=10K) + 6 full (global_head_dim=512, kv_heads=2, rope_theta=1M, K==V)
+- Embedding: non-quantized bf16, scaled by √hidden_size. Tied word embeddings via matmul (not quantized_matmul).
+- MoE: 128 experts, top_k=8, GELU activation. Router: RMSNormNoScale → scale → proj → per_expert_scale.
+- Dense MLP: GELU, runs in parallel with MoE every layer. Output = dense + expert.
+- Extra norms: pre/post_feedforward_layernorm, pre_feedforward_layernorm_2, post_feedforward_layernorm_{1,2}
+- Layer scalar: per-layer learned scalar applied at end of decoder layer
+- Logit softcapping: tanh(logits/30) × 30
+- **4-bit (group_size=64)**: per_expert_stride ~3.35 MB, ECB file ~428 MB/layer, 8 active = ~26.8 MB/layer
+- Weight naming: `weight_scales`/`weight_biases` (not `scales`/`biases` like Qwen). Handled by `load_qlinear_flex()`.
+- Source: `mlx-community/gemma-4-26b-a4b-it-4bit`
+- Split output: `./split_gemma4` (13 GB)
+
+#### Qwen 3.5 35B-A3B
+- Architecture: `qwen3_5_moe` mapping to `mlx_lm.models.qwen3_5` (NOT `qwen3_next`)
+- 40 layers: 30 linear-attention (GatedDeltaNet/ArraysCache) + 10 full-attention (Attention/KVCache), every 4th layer is full-attention
+- MoE: 256 experts, top_k=8, SiLU activation. Shared expert + shared expert gate per layer.
+- Attention: output gating (sigmoid gate), partial RoPE
+- Quantization read from config.json (bits + group_size). Supports 4-bit and 8-bit.
+- **4-bit (group_size=64)**: per_expert_stride ~1.77 MB, ECB file ~453 MB/layer, 8 active = ~14.2 MB/layer
+- Source: `mlx-community/Qwen3.5-35B-A3B-4bit`
 - Split output: `./split_model_st` (19 GB)
-- Warm set backup: `~/warm_experts_qwen35_35b_a3b.json` (from 8-bit profiling, compatible with 4-bit)
+- Warm set backup: `~/warm_experts_qwen35_35b_a3b.json`
+
+### Per-token I/O comparison (4-bit, top_k=8)
+| Model | Expert size | 8 active/layer | MoE layers | **I/O per token** |
+|-------|------------|----------------|------------|------------------|
+| Gemma4 26B | 3.35 MB | 26.8 MB | 30 | **803 MB** |
+| Qwen 3.5 35B | 1.77 MB | 14.2 MB | 40 | **566 MB** |
+
+Gemma4 reads 42% more data per token despite fewer layers — experts are ~2× bigger (hidden=2816×704 vs 2048×512).
+
+- 12 CPU threads available (M4)
 
 ## Performance
 
-### Current best — 4-bit, GCD reactive + speculative (default, no flags):
+### Gemma 4 26B-A4B 4-bit (default model, M4 16GB):
+- **83 tokens**: **4.0 tok/s** (implied 5.3), peaking at 4.6
+- Decode breakdown (190ms/tok): routing CPU/GCD prefetch 93ms (54%), layer eval 40ms (21%), routing eval 24ms (13%), extract 15ms (9%)
+- GPU wait: 30ms (pure compute, zero faults)
+- I/O-bound: 803 MB/token (experts are 3.35 MB each, 2× bigger than Qwen)
+- Gate-reuse prediction: 50.5% overall (24%–82% per-layer) — lower than Qwen due to different routing (norm+scale+per_expert_scale)
+
+### Qwen 3.5 35B-A3B 4-bit (M4 16GB):
 - **50 tokens**: **7.7 tok/s** (implied 8.1), peaking at 8.7
 - Decode breakdown (123ms/tok): routing CPU/GCD prefetch 48ms (39%), routing eval 34ms (28%), layer eval 32ms (26%), extract 10ms (8%)
 - GPU wait: 27ms (pure compute, zero faults)
@@ -81,7 +130,7 @@ cargo build --release
 - With `--warm-set`: 7.0 tok/s (warm set preloads 63% of experts, but GCD speculative provides similar benefit)
 - With `--kv-quant-bits 3`: ~5.3 tok/s (Hadamard rotation adds ~12ms/tok on 10 attention layers)
 
-### 4-bit benchmark matrix (50 tokens, M4 16GB):
+### Qwen 4-bit benchmark matrix (50 tokens, M4 16GB):
 | Config | tok/s | Routing CPU ms/tok | Layer eval ms/tok | GPU wait ms/tok |
 |--------|-------|--------------------|-------------------|-----------------|
 | **GCD reactive + speculative (default)** | **7.7→8.7** | **47.5** | **31.7** | **26.6** |
@@ -115,9 +164,9 @@ cargo build --release
 - Random 16 KB read (cold): 153 MB/s (107μs per read)
 - Page faults: 16KB per fault, synchronous kernel trap — 20× slower per byte than explicit pread
 
-### Expert prediction (measured 2026-03-30):
-- **Pre-MoE + next LN, top-12**: 84-86% accuracy (stable across runs)
-- Per-layer range: 57% (layer 1) to 96% (layer 34)
+### Expert prediction:
+- **Qwen** (measured 2026-03-30): **Pre-MoE + next LN, top-12**: 84-86% accuracy. Per-layer range: 57% (layer 1) to 96% (layer 34).
+- **Gemma4** (measured 2026-04-02): **50.5% overall** (top-12). Per-layer range: 24% (layer 1) to 82% (layer 22). Lower accuracy due to different router (norm+scale+per_expert_scale vs simple gate).
 - Prediction adds ~6ms routing eval overhead (batched into existing eval)
 
 ## Key gotchas

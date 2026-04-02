@@ -420,6 +420,7 @@ FodyWeavers.xsd
 # Split model output (large binary weights)
 split_model/
 split_model_st/
+split_gemma4/
 
 # Rust build artifacts
 target/

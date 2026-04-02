@@ -13,8 +13,8 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(name = "flash-qwen")]
-#[command(about = "All-Rust UMA-native MoE inference for Qwen3.5-35B-A3B")]
+#[command(name = "flash-moe")]
+#[command(about = "All-Rust UMA-native sparse MoE inference on Apple Silicon")]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -34,9 +34,9 @@ enum Command {
     },
     /// Generate text from a prompt
     Generate {
-        #[arg(long)]
+        #[arg(long, default_value = "./split_gemma4")]
         model_path: PathBuf,
-        #[arg(long)]
+        #[arg(long, default_value = "./split_gemma4")]
         tokenizer_path: PathBuf,
         #[arg(long, default_value = "Hello")]
         prompt: String,
@@ -100,13 +100,18 @@ fn main() -> anyhow::Result<()> {
             let tokenizer = tokenizer::QwenTokenizer::from_dir(&tokenizer_path)?;
 
             // Apply chat template
+            let is_gemma4 = args.model_type() == config::ModelType::Gemma4;
             let chat_prompt = tokenizer
                 .apply_chat_template(&[tokenizer::ChatMessage {
                     role: "user".to_string(),
                     content: prompt.clone(),
                 }])
                 .unwrap_or_else(|_| {
-                    format!("<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n", prompt)
+                    if is_gemma4 {
+                        format!("<bos><|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n", prompt)
+                    } else {
+                        format!("<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n", prompt)
+                    }
                 });
 
             // Create ExpertMemoryManager — mmaps expert files, used for on-demand loading

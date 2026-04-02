@@ -1,6 +1,12 @@
 use serde::Deserialize;
 use std::path::Path;
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ModelType {
+    Qwen,
+    Gemma4,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[allow(dead_code)]
 pub struct QuantizationConfig {
@@ -8,6 +14,22 @@ pub struct QuantizationConfig {
     pub group_size: u32,
     #[serde(default)]
     pub mode: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct RopeTypeConfig {
+    #[serde(default = "default_rope_theta_10k")]
+    pub rope_theta: f64,
+    #[serde(default = "default_1_0")]
+    pub partial_rotary_factor: f64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct RopeParameters {
+    #[serde(default)]
+    pub full_attention: Option<RopeTypeConfig>,
+    #[serde(default)]
+    pub sliding_attention: Option<RopeTypeConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -25,8 +47,8 @@ pub struct TextModelArgs {
     #[serde(default)]
     pub intermediate_size: Option<usize>,
     pub num_experts: usize,
-    pub num_experts_per_tok: usize,
     pub moe_intermediate_size: usize,
+    #[serde(default)]
     pub shared_expert_intermediate_size: usize,
     #[serde(default = "default_true")]
     pub norm_topk_prob: bool,
@@ -35,7 +57,13 @@ pub struct TextModelArgs {
     #[serde(default = "default_full_attn_interval")]
     pub full_attention_interval: usize,
 
-    // Linear attention (GatedDeltaNet)
+    // MoE top-k: Qwen uses num_experts_per_tok, Gemma4 uses top_k_experts
+    #[serde(default)]
+    pub num_experts_per_tok: Option<usize>,
+    #[serde(default)]
+    pub top_k_experts: Option<usize>,
+
+    // Linear attention (GatedDeltaNet) — Qwen only
     #[serde(default = "default_32")]
     pub linear_num_value_heads: usize,
     #[serde(default = "default_16")]
@@ -52,6 +80,24 @@ pub struct TextModelArgs {
     pub partial_rotary_factor: f64,
     #[serde(default)]
     pub max_position_embeddings: Option<usize>,
+    #[serde(default)]
+    pub rope_parameters: Option<RopeParameters>,
+
+    // Gemma4-specific
+    #[serde(default)]
+    pub layer_types: Option<Vec<String>>,
+    #[serde(default)]
+    pub global_head_dim: Option<usize>,
+    #[serde(default)]
+    pub num_global_key_value_heads: Option<usize>,
+    #[serde(default)]
+    pub attention_k_eq_v: bool,
+    #[serde(default)]
+    pub final_logit_softcapping: Option<f32>,
+    #[serde(default)]
+    pub sliding_window: Option<usize>,
+    #[serde(default)]
+    pub enable_moe_block: bool,
 
     // EOS tokens
     #[serde(default)]
@@ -84,6 +130,12 @@ impl EosTokenId {
 
 fn default_rope_theta() -> f64 {
     10_000_000.0
+}
+fn default_rope_theta_10k() -> f64 {
+    10_000.0
+}
+fn default_1_0() -> f64 {
+    1.0
 }
 fn default_partial_rotary() -> f64 {
     0.25
@@ -123,12 +175,52 @@ impl TextModelArgs {
         Ok((args, quant))
     }
 
+    pub fn model_type(&self) -> ModelType {
+        if self.layer_types.is_some() {
+            ModelType::Gemma4
+        } else {
+            ModelType::Qwen
+        }
+    }
+
+    pub fn experts_per_tok(&self) -> usize {
+        self.top_k_experts
+            .or(self.num_experts_per_tok)
+            .unwrap_or(8)
+    }
+
     pub fn is_linear_layer(&self, layer_idx: usize) -> bool {
         (layer_idx + 1) % self.full_attention_interval != 0
     }
 
+    pub fn is_full_attention(&self, layer_idx: usize) -> bool {
+        match &self.layer_types {
+            Some(types) => types[layer_idx] == "full_attention",
+            None => !self.is_linear_layer(layer_idx),
+        }
+    }
+
     pub fn rope_dims(&self) -> i32 {
         (self.head_dim as f64 * self.partial_rotary_factor) as i32
+    }
+
+    /// Get RoPE config for a Gemma4 layer (rope_dims, rope_theta).
+    pub fn gemma4_rope_config(&self, is_full: bool) -> (i32, f32) {
+        let params = self.rope_parameters.as_ref();
+        let cfg = if is_full {
+            params.and_then(|p| p.full_attention.as_ref())
+        } else {
+            params.and_then(|p| p.sliding_attention.as_ref())
+        };
+        let theta = cfg.map(|c| c.rope_theta).unwrap_or(10000.0) as f32;
+        let partial = cfg.map(|c| c.partial_rotary_factor).unwrap_or(1.0);
+        let head_dim = if is_full {
+            self.global_head_dim.unwrap_or(self.head_dim)
+        } else {
+            self.head_dim
+        };
+        let dims = (head_dim as f64 * partial) as i32;
+        (dims, theta)
     }
 
     /// Key dimension for linear attention: num_k_heads * key_head_dim

@@ -78,6 +78,8 @@ impl QwenTokenizer {
         let rendered = template.render(minijinja::context! {
             messages => messages,
             add_generation_prompt => true,
+            bos_token => "<bos>",
+            eos_token => "<eos>",
         })?;
         Ok(rendered)
     }

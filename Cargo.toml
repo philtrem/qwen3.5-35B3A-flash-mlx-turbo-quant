@@ -1,10 +1,10 @@
 [package]
-name = "flash-qwen"
-version = "0.1.0"
+name = "flash-moe"
+version = "0.2.0"
 edition = "2021"
 
 [[bin]]
-name = "flash-qwen"
+name = "flash-moe"
 path = "src/main.rs"
 
 [build-dependencies]

@@ -23,7 +23,8 @@ pub fn generate(
     speculate: bool,
 ) -> anyhow::Result<String> {
     let perf = PerfStats::new();
-    let tp = RefCell::new(TransitionProfiler::new(40));
+    let num_layers = model.model.layers.len();
+    let tp = RefCell::new(TransitionProfiler::new(num_layers));
     let input_ids = tokenizer.encode(prompt)?;
     let mut cache = model.make_cache(kv_quant_bits);
 

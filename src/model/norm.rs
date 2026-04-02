@@ -13,6 +13,21 @@ impl RMSNorm {
     }
 }
 
+/// RMSNormNoScale — rms_norm without learnable weight (Gemma4 v_norm).
+pub struct RMSNormNoScale {
+    pub eps: f32,
+}
+
+impl RMSNormNoScale {
+    pub fn forward(&self, x: &Array) -> Result<Array, Exception> {
+        let x2 = x * x;
+        let mean = mlx_rs::ops::mean_axes(&x2, &[-1], Some(true))?;
+        let eps = Array::from_f32(self.eps);
+        let rms = mlx_rs::ops::rsqrt(&(&mean + &eps))?;
+        Ok(x * &rms)
+    }
+}
+
 /// RMSNormGated — rms_norm with silu gating (precise swiglu in float32).
 pub struct RMSNormGated {
     pub weight: Array,

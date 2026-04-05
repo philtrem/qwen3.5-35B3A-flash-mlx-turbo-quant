@@ -136,6 +136,13 @@ impl DecoderLayer {
         let h = self.post_attention_layernorm.forward(&h)?;
         let h = &residual + &h;
 
+        // Store h_post_attn (bf16) for Level B prediction — will be read as raw bytes after routing eval
+        if let Some(tp_ref) = tp {
+            if !tp_ref.borrow().router_weights.is_empty() {
+                tp_ref.borrow_mut().h_post_attn = Some(h.clone());
+            }
+        }
+
         // Feedforward block: dense MLP + MoE in parallel
         let residual = h.clone();
 

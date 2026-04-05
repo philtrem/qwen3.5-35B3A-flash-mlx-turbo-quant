@@ -187,6 +187,7 @@ struct GcdPrefetchCtx {
 /// remain in page cache.
 extern "C" fn gcd_prefetch_worker(ctx: *mut std::ffi::c_void) {
     let ctx = unsafe { Box::from_raw(ctx as *mut GcdPrefetchCtx) };
+    let is_speculative = ctx.cancel_gen.is_some();
     let cancelled = || {
         ctx.cancel_gen.as_ref().is_some_and(|(counter, snapshot)| {
             counter.load(Ordering::Acquire) != *snapshot
@@ -194,16 +195,23 @@ extern "C" fn gcd_prefetch_worker(ctx: *mut std::ffi::c_void) {
     };
 
     if !cancelled() {
-        issue_rdadvise(ctx.fd, ctx.offset, ctx.len);
+        // Speculative: skip F_RDADVISE and madvise — they can't be cancelled once issued.
+        // Only do prefault touch which is cancellable page-by-page.
+        // Reactive: full pipeline (F_RDADVISE + madvise + prefault).
+        if !is_speculative {
+            issue_rdadvise(ctx.fd, ctx.offset, ctx.len);
+        }
     }
 
     if !cancelled() {
-        unsafe {
-            libc::madvise(
-                (ctx.mmap_addr + ctx.offset) as *mut libc::c_void,
-                ctx.len,
-                libc::MADV_WILLNEED,
-            );
+        if !is_speculative {
+            unsafe {
+                libc::madvise(
+                    (ctx.mmap_addr + ctx.offset) as *mut libc::c_void,
+                    ctx.len,
+                    libc::MADV_WILLNEED,
+                );
+            }
         }
 
         let base = ctx.mmap_addr + ctx.offset;

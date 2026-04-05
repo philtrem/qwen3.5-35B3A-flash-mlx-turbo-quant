@@ -180,6 +180,83 @@ impl CalibrationRecorder {
 }
 
 
+/// Router weights for Level B speculative prediction (pre-converted for CPU execution).
+pub struct RouterWeightsRef {
+    /// Router scale vector [hidden_size], pre-converted to f32
+    pub router_scale_f32: Vec<f32>,
+    /// Packed 4-bit weights [num_experts, hidden_size/8]
+    pub proj_weight_u32: Vec<u32>,
+    /// Dequant scales [num_experts, num_groups], pre-converted to f32
+    pub proj_scales_f32: Vec<f32>,
+    /// Dequant biases [num_experts, num_groups], pre-converted to f32
+    pub proj_biases_f32: Vec<f32>,
+    pub num_experts: usize,
+    pub hidden_size: usize,
+    pub group_size: usize,
+    pub root_size: f32,
+    pub rms_norm_eps: f32,
+}
+
+impl RouterWeightsRef {
+    /// Run router prediction entirely on CPU. ~0.1ms per layer.
+    pub fn predict_top_k(&self, h_post_attn_f32: &[f32], top_k: usize) -> Vec<i32> {
+        let n = self.hidden_size;
+
+        // 1. RMSNormNoScale
+        let sum_sq: f32 = h_post_attn_f32.iter().map(|x| x * x).sum();
+        let rms = (sum_sq / n as f32 + self.rms_norm_eps).sqrt().recip();
+
+        // 2. Norm + scale (fused: x * rms * root_size * router_scale)
+        let rs = self.root_size;
+        let scaled: Vec<f32> = h_post_attn_f32
+            .iter()
+            .zip(&self.router_scale_f32)
+            .map(|(&x, &s)| x * rms * rs * s)
+            .collect();
+
+        // 3. Dequantized matmul: [1, hidden] × [num_experts, hidden]^T → [num_experts]
+        let groups = n / self.group_size;
+        let packed_per_row = n / 8; // 4-bit: 8 values per u32
+        let mut scores = vec![0.0f32; self.num_experts];
+
+        for j in 0..self.num_experts {
+            let w_row = j * packed_per_row;
+            let sg_row = j * groups;
+            let mut dot = 0.0f32;
+
+            for g in 0..groups {
+                let scale = self.proj_scales_f32[sg_row + g];
+                let bias = self.proj_biases_f32[sg_row + g];
+                let base = g * self.group_size;
+                let packed_base = w_row + base / 8;
+
+                for k in 0..self.group_size / 8 {
+                    let packed = self.proj_weight_u32[packed_base + k];
+                    let input_base = base + k * 8;
+                    for bit in 0..8u32 {
+                        let nibble = ((packed >> (4 * bit)) & 0xF) as f32;
+                        let w = nibble * scale + bias;
+                        dot += scaled[input_base + bit as usize] * w;
+                    }
+                }
+            }
+            scores[j] = dot;
+        }
+
+        // 4. Top-k via partial sort
+        let mut indices: Vec<i32> = (0..self.num_experts as i32).collect();
+        indices.select_nth_unstable_by(top_k - 1, |&a, &b| {
+            scores[b as usize]
+                .partial_cmp(&scores[a as usize])
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let mut result: Vec<i32> = indices[..top_k].to_vec();
+        result.sort();
+        result.dedup();
+        result
+    }
+}
+
 /// Tracks prediction accuracy and manages co-occurrence prediction / calibration.
 pub struct TransitionProfiler {
     num_layers: usize,
@@ -193,6 +270,10 @@ pub struct TransitionProfiler {
     pub cooccur: Option<CooccurrencePredictor>,
     /// Calibration recorder (active during --calibrate)
     pub recorder: Option<CalibrationRecorder>,
+    /// Post-attention hidden state from current layer (set by forward_gemma4, consumed by MoE)
+    pub h_post_attn: Option<Array>,
+    /// Router weights per layer for Level B prediction
+    pub router_weights: Vec<RouterWeightsRef>,
 }
 
 impl TransitionProfiler {
@@ -206,6 +287,8 @@ impl TransitionProfiler {
             pending_prediction: None,
             cooccur: None,
             recorder: None,
+            h_post_attn: None,
+            router_weights: Vec::new(),
         }
     }
 
@@ -232,8 +315,16 @@ impl TransitionProfiler {
     /// Report prediction accuracy.
     pub fn report(&self) {
         if self.gate_total > 0 {
-            let method = if self.cooccur.is_some() { "co-occurrence" } else { "router-projection" };
-            let k = self.cooccur.as_ref().map(|c| c.pred_k).unwrap_or(12);
+            let method = if !self.router_weights.is_empty() {
+                "level-B router"
+            } else if self.cooccur.is_some() {
+                "co-occurrence"
+            } else {
+                "router-projection"
+            };
+            let k = if !self.router_weights.is_empty() { 12 } else {
+                self.cooccur.as_ref().map(|c| c.pred_k).unwrap_or(12)
+            };
             eprintln!("\n=== Prediction ({method}, top-{k}) ===");
             eprintln!(
                 "  Overall: {:.1}% ({}/{})",
@@ -586,7 +677,7 @@ impl Gemma4MoeBlock {
         let seq_len = x.dim(1);
         let is_decode = seq_len == 1;
 
-        // GPU sync: routing + scores
+        // GPU sync: routing + scores (h_post_attn materializes as a dependency)
         let _t = Instant::now();
         mlx_rs::transforms::eval([&flat_idx, &scores_f32])?;
         perf.acc(&perf.moe_routing_eval, _t.elapsed());
@@ -610,13 +701,14 @@ impl Gemma4MoeBlock {
         for (i, &idx) in flat_data.iter().enumerate() {
             *weight_map.entry(idx).or_insert(0.0) += scores_data[i];
         }
+
         perf.acc(&perf.routing_cpu, _t.elapsed());
 
-        // Prediction + accuracy tracking + calibration recording
+        // Accuracy tracking + prediction for next layer
         if let Some(tp_ref) = tp {
             let mut tp_mut = tp_ref.borrow_mut();
 
-            // Check pending prediction from previous layer
+            // Check pending prediction from PREVIOUS layer (must happen before setting new one)
             if let Some((pred_layer, predicted)) = tp_mut.pending_prediction.take() {
                 if pred_layer == self.layer_idx {
                     tp_mut.record_gate_reuse(self.layer_idx, &predicted, &unique);
@@ -628,9 +720,35 @@ impl Gemma4MoeBlock {
                 rec.record_layer(self.layer_idx, &unique);
             }
 
-            // Predict next layer via co-occurrence table (CPU lookup, ~0 cost)
-            if is_decode {
-                if let Some(ref cooccur) = tp_mut.cooccur {
+            // Predict next layer's experts
+            if is_decode && self.layer_idx + 1 < tp_mut.num_layers {
+                if !tp_mut.router_weights.is_empty()
+                    && self.layer_idx + 1 < tp_mut.router_weights.len()
+                {
+                    // Level B (pure CPU): read h_post_attn, convert to f32, run router
+                    if let Some(h_pa) = tp_mut.h_post_attn.take() {
+                        // h_pa is materialized by routing eval (dependency chain)
+                        // Read via FFI — handle both bf16 and f32 dtypes
+                        let n = h_pa.size();
+                        let h_f32: Vec<f32> = if h_pa.dtype() == mlx_rs::Dtype::Bfloat16 {
+                            unsafe {
+                                let ptr = mlx_sys::mlx_array_data_uint16(h_pa.as_ptr());
+                                let raw = std::slice::from_raw_parts(ptr, n);
+                                raw.iter()
+                                    .map(|&b| f32::from_bits((b as u32) << 16))
+                                    .collect()
+                            }
+                        } else {
+                            // f32 path
+                            let data: &[f32] = h_pa.as_slice();
+                            data.to_vec()
+                        };
+                        let rw = &tp_mut.router_weights[self.layer_idx + 1];
+                        let predicted = rw.predict_top_k(&h_f32, 12);
+                        tp_mut.pending_prediction = Some((self.layer_idx + 1, predicted));
+                    }
+                } else if let Some(ref cooccur) = tp_mut.cooccur {
+                    // Fallback: co-occurrence table
                     let predicted = cooccur.predict(self.layer_idx, &unique);
                     tp_mut.pending_prediction = Some((self.layer_idx + 1, predicted));
                 }

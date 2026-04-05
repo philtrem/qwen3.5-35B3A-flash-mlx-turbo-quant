@@ -2,6 +2,7 @@ use mlx_rs::error::Exception;
 use mlx_rs::Array;
 
 /// Quantized linear layer — 8-bit weights with scales and biases.
+#[derive(Clone)]
 pub struct QuantizedLinear {
     pub weight: Array,  // uint32 packed
     pub scales: Array,  // bfloat16

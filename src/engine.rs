@@ -7,7 +7,8 @@ use mlx_rs::Array;
 
 use crate::memory::ExpertMemoryManager;
 use crate::model::Model;
-use crate::model::moe::{TransitionProfiler, CooccurrencePredictor, CalibrationRecorder};
+use crate::model::moe::{TransitionProfiler, CooccurrencePredictor, CalibrationRecorder, RouterWeightsRef};
+use crate::model::MoeVariant;
 use crate::perf::PerfStats;
 use crate::tokenizer::QwenTokenizer;
 
@@ -29,6 +30,43 @@ pub fn generate(
     let mut tp_inner = TransitionProfiler::new(num_layers);
     tp_inner.cooccur = cooccur;
     tp_inner.recorder = recorder;
+
+    // Populate Level B router weights from Gemma4 layers (pre-convert to f32 for CPU)
+    for layer in &model.model.layers {
+        if let MoeVariant::Gemma4(ref moe) = layer.mlp {
+            // Convert router_scale bf16 → f32
+            let rs_f32 = moe.router_scale.as_dtype(mlx_rs::Dtype::Float32).unwrap();
+            mlx_rs::transforms::eval(std::iter::once(&rs_f32)).unwrap();
+            let rs_data: &[f32] = rs_f32.as_slice();
+
+            // Read quantized projection weights as raw slices
+            let w_data: &[u32] = moe.router_proj.weight.as_slice();
+            let s_f32 = moe.router_proj.scales.as_dtype(mlx_rs::Dtype::Float32).unwrap();
+            let b_f32 = moe.router_proj.biases.as_dtype(mlx_rs::Dtype::Float32).unwrap();
+            mlx_rs::transforms::eval([&s_f32, &b_f32]).unwrap();
+            let s_data: &[f32] = s_f32.as_slice();
+            let b_data: &[f32] = b_f32.as_slice();
+
+            let hidden_size = rs_data.len();
+            let num_experts = moe.router_proj.weight.dim(0) as usize;
+
+            tp_inner.router_weights.push(RouterWeightsRef {
+                router_scale_f32: rs_data.to_vec(),
+                proj_weight_u32: w_data.to_vec(),
+                proj_scales_f32: s_data.to_vec(),
+                proj_biases_f32: b_data.to_vec(),
+                num_experts,
+                hidden_size,
+                group_size: moe.group_size as usize,
+                root_size: moe.root_size,
+                rms_norm_eps: moe.rms_norm_eps,
+            });
+        }
+    }
+    if !tp_inner.router_weights.is_empty() {
+        eprintln!("Level B prediction (CPU): {} layers", tp_inner.router_weights.len());
+    }
+
     let tp = RefCell::new(tp_inner);
     let input_ids = tokenizer.encode(prompt)?;
     let mut cache = model.make_cache(kv_quant_bits);

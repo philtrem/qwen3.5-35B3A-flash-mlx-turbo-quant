@@ -422,6 +422,10 @@ split_model/
 split_model_st/
 split_gemma4/
 
+# Downloaded model weights
+gemma-4-26b-a4b-it-MLX-4bit/
+Qwen3.5-35B-A3B-4bit/
+
 # Rust build artifacts
 target/
 

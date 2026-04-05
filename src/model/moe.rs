@@ -721,34 +721,13 @@ impl Gemma4MoeBlock {
             }
 
             // Predict next layer's experts
-            if is_decode && self.layer_idx + 1 < tp_mut.num_layers {
-                if !tp_mut.router_weights.is_empty()
-                    && self.layer_idx + 1 < tp_mut.router_weights.len()
-                {
-                    // Level B (pure CPU): read h_post_attn, convert to f32, run router
-                    if let Some(h_pa) = tp_mut.h_post_attn.take() {
-                        // h_pa is materialized by routing eval (dependency chain)
-                        // Read via FFI — handle both bf16 and f32 dtypes
-                        let n = h_pa.size();
-                        let h_f32: Vec<f32> = if h_pa.dtype() == mlx_rs::Dtype::Bfloat16 {
-                            unsafe {
-                                let ptr = mlx_sys::mlx_array_data_uint16(h_pa.as_ptr());
-                                let raw = std::slice::from_raw_parts(ptr, n);
-                                raw.iter()
-                                    .map(|&b| f32::from_bits((b as u32) << 16))
-                                    .collect()
-                            }
-                        } else {
-                            // f32 path
-                            let data: &[f32] = h_pa.as_slice();
-                            data.to_vec()
-                        };
-                        let rw = &tp_mut.router_weights[self.layer_idx + 1];
-                        let predicted = rw.predict_top_k(&h_f32, 12);
-                        tp_mut.pending_prediction = Some((self.layer_idx + 1, predicted));
-                    }
-                } else if let Some(ref cooccur) = tp_mut.cooccur {
-                    // Fallback: co-occurrence table
+            // For Gemma4: Level A.5 runs in TextModel::forward (after this returns),
+            // using h_post_attn preserved in tp. Don't consume it here.
+            // For Qwen or when router_weights empty: use co-occurrence fallback.
+            if is_decode && self.layer_idx + 1 < tp_mut.num_layers
+                && tp_mut.h_post_attn.is_none()  // Level A.5 didn't store h_post_attn
+            {
+                if let Some(ref cooccur) = tp_mut.cooccur {
                     let predicted = cooccur.predict(self.layer_idx, &unique);
                     tp_mut.pending_prediction = Some((self.layer_idx + 1, predicted));
                 }

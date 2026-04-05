@@ -11,10 +11,13 @@ enum ExpertLayout {
     /// Qwen: language_model.model.layers.{i}.mlp.switch_mlp.{gate,up,down}_proj.{weight,scales,biases}
     /// 9 tensors per layer, each (num_experts, d1, d2).
     Qwen,
-    /// Gemma 4: model.language_model.layers.{i}.experts.{gate_up_proj,down_proj}[_{scales,biases}]
+    /// Gemma 4 (mlx-community): model.language_model.layers.{i}.experts.{gate_up_proj,down_proj}[_{scales,biases}]
     /// 6 tensors per layer; gate_up_proj is fused (first half = gate, second half = up).
     /// Unfused to 9 tensors during ECB writing for compatibility.
     Gemma4,
+    /// Gemma 4 (Unsloth UD): language_model.model.layers.{i}.experts.switch_glu.{gate,up,down}_proj.{weight,scales,biases}
+    /// 9 tensors per layer, already unfused.
+    Gemma4Ud,
 }
 
 /// Detect expert layout from weight map keys.
@@ -22,6 +25,9 @@ fn detect_layout(weight_map: &serde_json::Map<String, Value>) -> ExpertLayout {
     for key in weight_map.keys() {
         if key.contains("switch_mlp") {
             return ExpertLayout::Qwen;
+        }
+        if key.contains(".experts.switch_glu.") {
+            return ExpertLayout::Gemma4Ud;
         }
         if key.contains(".experts.gate_up_proj") || key.contains(".experts.down_proj") {
             return ExpertLayout::Gemma4;
@@ -39,18 +45,19 @@ fn is_expert_tensor(key: &str, layout: &ExpertLayout) -> bool {
             // Match experts.gate_up_proj, experts.down_proj, and their _scales/_biases variants
             key.contains(".experts.gate_up_proj") || key.contains(".experts.down_proj")
         }
+        ExpertLayout::Gemma4Ud => key.contains(".experts.switch_glu."),
     }
 }
 
 /// Discover the number of layers that have expert tensors.
 fn discover_num_expert_layers(weight_map: &serde_json::Map<String, Value>, layout: &ExpertLayout) -> u32 {
     let layer_prefix = match layout {
-        ExpertLayout::Qwen => "language_model.model.layers.",
+        ExpertLayout::Qwen | ExpertLayout::Gemma4Ud => "language_model.model.layers.",
         ExpertLayout::Gemma4 => "model.language_model.layers.",
     };
     let expert_marker = match layout {
         ExpertLayout::Qwen => "switch_mlp",
-        ExpertLayout::Gemma4 => ".experts.",
+        ExpertLayout::Gemma4 | ExpertLayout::Gemma4Ud => ".experts.",
     };
 
     let mut max_layer = 0u32;
@@ -68,11 +75,22 @@ fn discover_num_expert_layers(weight_map: &serde_json::Map<String, Value>, layou
     max_layer + 1
 }
 
-/// Determine the prefix to strip from resident tensor names.
-fn resident_prefix(layout: &ExpertLayout) -> &'static str {
+/// Canonicalize a resident tensor name: strip model-specific prefix to produce
+/// names starting with "language_model.layers.N..." for all layouts.
+fn canonicalize_resident_name(name: &str, layout: &ExpertLayout) -> String {
     match layout {
-        ExpertLayout::Qwen => "language_model.",
-        ExpertLayout::Gemma4 => "model.",
+        ExpertLayout::Qwen => name
+            .strip_prefix("language_model.")
+            .unwrap_or(name)
+            .to_string(),
+        ExpertLayout::Gemma4 => name
+            .strip_prefix("model.")
+            .unwrap_or(name)
+            .to_string(),
+        // language_model.model.layers.N.X → language_model.layers.N.X
+        // language_model.model.embed_tokens.X → language_model.embed_tokens.X
+        ExpertLayout::Gemma4Ud => name
+            .replacen("language_model.model.", "language_model.", 1),
     }
 }
 
@@ -111,6 +129,7 @@ pub fn split_model(model_path: &Path, output_path: &Path, format: &str) -> io::R
     let layout_name = match &layout {
         ExpertLayout::Qwen => "Qwen (switch_mlp, separate gate/up)",
         ExpertLayout::Gemma4 => "Gemma 4 (experts, fused gate_up_proj)",
+        ExpertLayout::Gemma4Ud => "Gemma 4 UD (switch_glu, separate gate/up)",
     };
     eprintln!("Detected expert layout: {}", layout_name);
 
@@ -242,7 +261,6 @@ fn write_resident_weights(
     layout: &ExpertLayout,
 ) -> io::Result<()> {
     let shard_headers = parse_all_shard_headers(shard_mmaps)?;
-    let prefix = resident_prefix(layout);
 
     let mut tensor_data: Vec<(String, Vec<u8>, String, Vec<usize>)> = Vec::new();
 
@@ -255,10 +273,7 @@ fn write_resident_weights(
         let shape = tensor_shape(header, tensor_name)?;
         let dtype = tensor_dtype(header, tensor_name)?;
 
-        let clean_name = tensor_name
-            .strip_prefix(prefix)
-            .unwrap_or(tensor_name)
-            .to_string();
+        let clean_name = canonicalize_resident_name(tensor_name, layout);
 
         tensor_data.push((clean_name, data.to_vec(), dtype, shape));
     }
@@ -464,6 +479,7 @@ fn write_expert_ecb(
         let tensor_metas = match layout {
             ExpertLayout::Qwen => collect_qwen_tensors(layer_idx, weight_map, shard_mmaps, &shard_headers)?,
             ExpertLayout::Gemma4 => collect_gemma4_tensors(layer_idx, weight_map, shard_mmaps, &shard_headers)?,
+            ExpertLayout::Gemma4Ud => collect_gemma4_ud_tensors(layer_idx, weight_map, shard_mmaps, &shard_headers)?,
         };
 
         let num_experts = tensor_metas[0].num_experts;
@@ -568,6 +584,28 @@ fn collect_gemma4_tensors(
     metas.extend(up_w_s_b);
     metas.extend(down_w_s_b);
 
+    Ok(metas)
+}
+
+/// Collect 9 TensorMetas for a Gemma 4 UD layer (already unfused switch_glu).
+/// Order: gate.w, gate.s, gate.b, up.w, up.s, up.b, down.w, down.s, down.b
+fn collect_gemma4_ud_tensors(
+    layer_idx: u32,
+    weight_map: &serde_json::Map<String, Value>,
+    shard_mmaps: &HashMap<String, Mmap>,
+    shard_headers: &HashMap<String, Value>,
+) -> io::Result<Vec<TensorMeta>> {
+    let prefix = format!("language_model.model.layers.{}.experts.switch_glu", layer_idx);
+    let proj_names = ["gate_proj", "up_proj", "down_proj"];
+    let comp_names = ["weight", "scales", "biases"];
+
+    let mut metas = Vec::with_capacity(9);
+    for proj in &proj_names {
+        for comp in &comp_names {
+            let name = format!("{}.{}.{}", prefix, proj, comp);
+            metas.push(load_tensor_meta(&name, weight_map, shard_mmaps, shard_headers)?);
+        }
+    }
     Ok(metas)
 }
 

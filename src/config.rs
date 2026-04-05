@@ -1,4 +1,5 @@
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::path::Path;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -8,12 +9,77 @@ pub enum ModelType {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+pub struct QuantOverride {
+    pub bits: u32,
+    pub group_size: u32,
+}
+
+#[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct QuantizationConfig {
     pub bits: u32,
     pub group_size: u32,
-    #[serde(default)]
     pub mode: Option<String>,
+    /// Per-component overrides keyed by weight path (e.g. "language_model.model.layers.0.self_attn.q_proj")
+    pub overrides: HashMap<String, QuantOverride>,
+}
+
+impl QuantizationConfig {
+    /// Look up bits for a specific weight path, falling back to the global default.
+    pub fn bits_for(&self, path: &str) -> i32 {
+        self.overrides
+            .get(path)
+            .map(|o| o.bits as i32)
+            .unwrap_or(self.bits as i32)
+    }
+
+    /// Look up group_size for a specific weight path.
+    pub fn group_size_for(&self, path: &str) -> i32 {
+        self.overrides
+            .get(path)
+            .map(|o| o.group_size as i32)
+            .unwrap_or(self.group_size as i32)
+    }
+}
+
+impl<'de> Deserialize<'de> for QuantizationConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let map: serde_json::Map<String, serde_json::Value> =
+            serde_json::Map::deserialize(deserializer)?;
+
+        let bits = map
+            .get("bits")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(4) as u32;
+        let group_size = map
+            .get("group_size")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(64) as u32;
+        let mode = map
+            .get("mode")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+
+        let mut overrides = HashMap::new();
+        for (key, value) in &map {
+            if matches!(key.as_str(), "bits" | "group_size" | "mode") {
+                continue;
+            }
+            if let Ok(ovr) = serde_json::from_value::<QuantOverride>(value.clone()) {
+                overrides.insert(key.clone(), ovr);
+            }
+        }
+
+        Ok(QuantizationConfig {
+            bits,
+            group_size,
+            mode,
+            overrides,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]

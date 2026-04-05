@@ -210,11 +210,22 @@ impl TextModel {
                 hidden.reshape(&[shape[0], shape[1], -1])?
             }
             ModelType::Gemma4 => {
-                // Non-quantized embedding + scale by sqrt(hidden_size)
                 let flat_ids = input_ids.flatten(None, None)?;
-                let h = mlx_rs::ops::indexing::take_axis(&self.embed_tokens_weight, &flat_ids, 0)?;
+                let h = if let Some(ref scales) = self.embed_tokens_scales {
+                    // Quantized embedding (UD models: 6-bit)
+                    let w = mlx_rs::ops::indexing::take_axis(&self.embed_tokens_weight, &flat_ids, 0)?;
+                    let s = mlx_rs::ops::indexing::take_axis(scales, &flat_ids, 0)?;
+                    let b = mlx_rs::ops::indexing::take_axis(self.embed_tokens_biases.as_ref().unwrap(), &flat_ids, 0)?;
+                    mlx_rs::ops::dequantize(
+                        &w, &s, &b, Some(self.embed_group_size), Some(self.embed_bits),
+                    )?
+                } else {
+                    // Non-quantized bf16 embedding
+                    mlx_rs::ops::indexing::take_axis(&self.embed_tokens_weight, &flat_ids, 0)?
+                };
                 let shape = input_ids.shape();
                 let h = h.reshape(&[shape[0], shape[1], -1])?;
+                // Scale by sqrt(hidden_size)
                 if let Some(scale) = self.embed_scale {
                     let s = Array::from_f32(scale).as_dtype(h.dtype())?;
                     &h * &s
@@ -436,9 +447,22 @@ impl Model {
                     )?
                 }
                 ModelType::Gemma4 => {
-                    // Non-quantized embedding: matmul(out, weight.T)
-                    let w_t = mlx_rs::ops::transpose_axes(&self.model.embed_tokens_weight, &[1, 0])?.as_dtype(out.dtype())?;
-                    mlx_rs::ops::matmul(&out, &w_t)?
+                    if self.model.embed_tokens_scales.is_some() {
+                        // Quantized embedding: use quantized_matmul
+                        mlx_rs::ops::quantized_matmul(
+                            &out,
+                            &self.model.embed_tokens_weight,
+                            self.model.embed_tokens_scales.as_ref().unwrap(),
+                            self.model.embed_tokens_biases.as_ref().unwrap(),
+                            Some(true),
+                            Some(self.model.embed_group_size),
+                            Some(self.model.embed_bits),
+                        )?
+                    } else {
+                        // Non-quantized embedding: matmul(out, weight.T)
+                        let w_t = mlx_rs::ops::transpose_axes(&self.model.embed_tokens_weight, &[1, 0])?.as_dtype(out.dtype())?;
+                        mlx_rs::ops::matmul(&out, &w_t)?
+                    }
                 }
             }
         } else {
@@ -633,9 +657,24 @@ fn load_gemma4_model(split_path: &Path, args: &TextModelArgs, quant: Option<&cra
         weights.values().map(|a| a.nbytes()).sum::<usize>() as f64 / 1e9
     );
 
-    let bits = quant.map(|q| q.bits as i32).unwrap_or(8);
-    let group_size = quant.map(|q| q.group_size as i32).unwrap_or(32);
-    eprintln!("  Quantization: {}-bit, group_size={}", bits, group_size);
+    let default_bits = quant.map(|q| q.bits as i32).unwrap_or(8);
+    let default_gs = quant.map(|q| q.group_size as i32).unwrap_or(32);
+    let has_overrides = quant.map(|q| !q.overrides.is_empty()).unwrap_or(false);
+
+    // Per-component quantization lookup (config paths use original naming)
+    let q_bits = |component: &str| -> (i32, i32) {
+        match quant {
+            Some(q) => (q.bits_for(component), q.group_size_for(component)),
+            None => (default_bits, default_gs),
+        }
+    };
+
+    if has_overrides {
+        eprintln!("  Quantization: mixed-precision (default {}-bit, {} overrides)",
+            default_bits, quant.unwrap().overrides.len());
+    } else {
+        eprintln!("  Quantization: {}-bit, group_size={}", default_bits, default_gs);
+    }
 
     let layer_types = args.layer_types.as_ref().unwrap();
     let global_head_dim = args.global_head_dim.unwrap_or(args.head_dim);
@@ -644,6 +683,8 @@ fn load_gemma4_model(split_path: &Path, args: &TextModelArgs, quant: Option<&cra
     let mut layers = Vec::with_capacity(args.num_hidden_layers);
     for i in 0..args.num_hidden_layers {
         let prefix = format!("language_model.layers.{}", i);
+        // Config override paths use original naming: language_model.model.layers.N...
+        let cfg_prefix = format!("language_model.model.layers.{}", i);
         let is_full = layer_types[i] == "full_attention";
         let use_k_eq_v = args.attention_k_eq_v && is_full;
 
@@ -656,8 +697,9 @@ fn load_gemma4_model(split_path: &Path, args: &TextModelArgs, quant: Option<&cra
             eps: args.rms_norm_eps,
         };
 
-        // Attention
+        // Attention — look up bits per component (typically 8-bit for UD models)
         let p = format!("{}.self_attn", prefix);
+        let (attn_bits, attn_gs) = q_bits(&format!("{}.self_attn.q_proj", cfg_prefix));
         let head_dim = if is_full { global_head_dim } else { args.head_dim };
         let num_kv_heads = if use_k_eq_v { num_global_kv_heads } else { args.num_key_value_heads };
         let (rope_dims, rope_theta) = args.gemma4_rope_config(is_full);
@@ -665,14 +707,15 @@ fn load_gemma4_model(split_path: &Path, args: &TextModelArgs, quant: Option<&cra
         let v_proj = if use_k_eq_v {
             None
         } else {
-            Some(load_qlinear_flex(&weights, &format!("{}.v_proj", p), bits, group_size))
+            let (vb, vgs) = q_bits(&format!("{}.self_attn.v_proj", cfg_prefix));
+            Some(load_qlinear_flex(&weights, &format!("{}.v_proj", p), vb, vgs))
         };
 
         let attention = AttentionLayer::Gemma4(Gemma4Attention {
-            q_proj: load_qlinear_flex(&weights, &format!("{}.q_proj", p), bits, group_size),
-            k_proj: load_qlinear_flex(&weights, &format!("{}.k_proj", p), bits, group_size),
+            q_proj: load_qlinear_flex(&weights, &format!("{}.q_proj", p), attn_bits, attn_gs),
+            k_proj: load_qlinear_flex(&weights, &format!("{}.k_proj", p), attn_bits, attn_gs),
             v_proj,
-            o_proj: load_qlinear_flex(&weights, &format!("{}.o_proj", p), bits, group_size),
+            o_proj: load_qlinear_flex(&weights, &format!("{}.o_proj", p), attn_bits, attn_gs),
             q_norm: RMSNorm {
                 weight: get_weight(&weights, &format!("{}.q_norm.weight", p)),
                 eps: args.rms_norm_eps,
@@ -712,26 +755,30 @@ fn load_gemma4_model(split_path: &Path, args: &TextModelArgs, quant: Option<&cra
             eps: args.rms_norm_eps,
         };
 
-        // Dense MLP (runs in parallel with MoE)
+        // Dense MLP — bits vary per layer for UD (3-5 bit)
         let mlp_prefix = format!("{}.mlp", prefix);
+        let (mlp_bits, mlp_gs) = q_bits(&format!("{}.mlp.gate_proj", cfg_prefix));
         let dense_mlp = GeLUMLP {
-            gate_proj: load_qlinear_flex(&weights, &format!("{}.gate_proj", mlp_prefix), bits, group_size),
-            up_proj: load_qlinear_flex(&weights, &format!("{}.up_proj", mlp_prefix), bits, group_size),
-            down_proj: load_qlinear_flex(&weights, &format!("{}.down_proj", mlp_prefix), bits, group_size),
+            gate_proj: load_qlinear_flex(&weights, &format!("{}.gate_proj", mlp_prefix), mlp_bits, mlp_gs),
+            up_proj: load_qlinear_flex(&weights, &format!("{}.up_proj", mlp_prefix), mlp_bits, mlp_gs),
+            down_proj: load_qlinear_flex(&weights, &format!("{}.down_proj", mlp_prefix), mlp_bits, mlp_gs),
         };
 
         // MoE router
         let router_prefix = format!("{}.router", prefix);
+        let (router_bits, router_gs) = q_bits(&format!("{}.router.proj", cfg_prefix));
+        // Expert bits (used at inference for gather_qmm)
+        let (expert_bits, expert_gs) = q_bits(&format!("{}.experts.switch_glu.gate_proj", cfg_prefix));
         let moe = MoeVariant::Gemma4(Gemma4MoeBlock {
-            router_proj: load_qlinear_flex(&weights, &format!("{}.proj", router_prefix), bits, group_size),
+            router_proj: load_qlinear_flex(&weights, &format!("{}.proj", router_prefix), router_bits, router_gs),
             router_scale: get_weight(&weights, &format!("{}.scale", router_prefix)),
             per_expert_scale: get_weight(&weights, &format!("{}.per_expert_scale", router_prefix)),
             root_size: (args.hidden_size as f32).powf(-0.5),
             rms_norm_eps: args.rms_norm_eps,
             top_k: args.experts_per_tok(),
             layer_idx: i,
-            bits,
-            group_size,
+            bits: expert_bits,
+            group_size: expert_gs,
         });
 
         // Layer scalar
@@ -761,25 +808,38 @@ fn load_gemma4_model(split_path: &Path, args: &TextModelArgs, quant: Option<&cra
         eps: args.rms_norm_eps,
     };
 
-    // Embedding is NOT quantized for Gemma4 — just bf16 weight
+    // Embedding — may be quantized (UD models have 6-bit) or plain bf16
     let embed_weight = get_weight(&weights, "language_model.embed_tokens.weight");
+    let embed_scales = weights.get("language_model.embed_tokens.scales")
+        .or_else(|| weights.get("language_model.embed_tokens.weight_scales"))
+        .cloned();
+    let embed_biases = weights.get("language_model.embed_tokens.biases")
+        .or_else(|| weights.get("language_model.embed_tokens.weight_biases"))
+        .cloned();
+    let (embed_bits, embed_gs) = q_bits("language_model.model.embed_tokens");
+
+    if embed_scales.is_some() {
+        eprintln!("  Embedding: {}-bit quantized", embed_bits);
+    } else {
+        eprintln!("  Embedding: bf16 (unquantized)");
+    }
 
     // Dummy lm_head (not used when tie_word_embeddings=true)
     let dummy_lm_head = QuantizedLinear {
         weight: Array::from_f32(0.0),
         scales: Array::from_f32(0.0),
         biases: Array::from_f32(0.0),
-        bits,
-        group_size,
+        bits: default_bits,
+        group_size: default_gs,
     };
 
     Ok(Model {
         model: TextModel {
             embed_tokens_weight: embed_weight,
-            embed_tokens_scales: None,
-            embed_tokens_biases: None,
-            embed_bits: bits,
-            embed_group_size: group_size,
+            embed_tokens_scales: embed_scales,
+            embed_tokens_biases: embed_biases,
+            embed_bits,
+            embed_group_size: embed_gs,
             layers,
             norm: final_norm,
             full_attention_interval: 1, // not used for Gemma4
@@ -823,7 +883,21 @@ fn load_qlinear(
     }
 }
 
-/// Load quantized linear with flexible naming (Qwen: .scales/.biases, Gemma4: .weight_scales/.weight_biases)
+/// MLX Metal kernels only support these bit widths for quantized_matmul.
+const SUPPORTED_QUANT_BITS: &[i32] = &[2, 3, 4, 6, 8];
+
+/// Find the largest supported bit width <= requested bits.
+fn nearest_supported_bits(bits: i32) -> i32 {
+    *SUPPORTED_QUANT_BITS
+        .iter()
+        .rev()
+        .find(|&&b| b <= bits)
+        .unwrap_or(&4)
+}
+
+/// Load quantized linear with flexible naming (Qwen: .scales/.biases, Gemma4: .weight_scales/.weight_biases).
+/// If bits is unsupported by MLX Metal kernels (e.g. 5-bit), dequantizes and re-quantizes
+/// to the nearest supported bit width at load time.
 fn load_qlinear_flex(
     weights: &HashMap<String, Array>,
     prefix: &str,
@@ -839,7 +913,23 @@ fn load_qlinear_flex(
         .or_else(|| weights.get(&format!("{}.weight_biases", prefix)))
         .unwrap_or_else(|| panic!("missing biases for: {}", prefix))
         .clone();
-    QuantizedLinear { weight, scales, biases, bits, group_size }
+
+    if !SUPPORTED_QUANT_BITS.contains(&bits) {
+        let target_bits = nearest_supported_bits(bits);
+        eprintln!("    Re-quantizing {}: {}-bit → {}-bit (unsupported kernel)", prefix, bits, target_bits);
+        // Force dequantize on CPU — Metal has no kernel for this bit width
+        let cpu_stream = mlx_rs::Stream::cpu();
+        let dequant = mlx_rs::ops::dequantize_device(
+            &weight, &scales, &biases, Some(group_size), Some(bits), &cpu_stream,
+        ).expect("dequantize failed");
+        mlx_rs::transforms::eval(std::iter::once(&dequant)).expect("eval dequantize failed");
+        let (new_w, new_s, new_b) = mlx_rs::ops::quantize(&dequant, Some(group_size), Some(target_bits))
+            .expect("re-quantize failed");
+        mlx_rs::transforms::eval([&new_w, &new_s, &new_b].into_iter()).expect("eval quantize failed");
+        QuantizedLinear { weight: new_w, scales: new_s, biases: new_b, bits: target_bits, group_size }
+    } else {
+        QuantizedLinear { weight, scales, biases, bits, group_size }
+    }
 }
 
 fn create_attention_mask(

@@ -13,10 +13,10 @@ Detailed implementation history, decisions, and performance data are in the auto
 Flash-loading inference engine for sparse MoE models on Mac M4 base 16GB. All-Rust single binary via `mlx-rs`, on-demand expert loading via GCD prefetch + zero-copy mmap Metal buffers.
 
 **Supported models:**
-- **Gemma 4 26B-A4B** (default) — `gemma4` architecture, 30 layers, 128 experts, top_k=8
-- **Qwen 3.5 35B-A3B** — `qwen3_5_moe` architecture, 40 layers, 256 experts, top_k=8
+- **Gemma 4 26B-A4B** (default) — `gemma4` architecture, 30 layers, 128 experts, top_k=8. Uses **Unsloth UD-MLX-3bit** dynamic quantization (3-bit experts, 8-bit attention, 6-bit embedding).
+- **Qwen 3.5 35B-A3B** — `qwen3_5_moe` architecture, 40 layers, 256 experts, top_k=8. Uniform 4-bit.
 
-Model type is auto-detected from config.json (`layer_types` field present → Gemma4, otherwise Qwen).
+Model type is auto-detected from config.json (`layer_types` field present → Gemma4, otherwise Qwen). Quantization supports both uniform and per-component mixed-precision (Unsloth UD format).
 
 ## Build
 
@@ -29,11 +29,13 @@ cargo build --release
 ```bash
 # Split model (one-time, creates ECB format)
 ./target/release/flash-moe split \
-  --model-path /path/to/mlx-community/model \
+  --model-path /path/to/model \
   --output-path ./split_output
 
-# Generate (defaults to ./split_gemma4 model path)
+# Generate — Gemma 4 UD-3bit (default model path: ./split_gemma4)
 ./target/release/flash-moe generate \
+  --model-path ./split_gemma4_ud3 \
+  --tokenizer-path ./gemma4-ud-3bit \
   --prompt "Hello" --max-tokens 256
 
 # Qwen model (must specify paths)
@@ -45,7 +47,7 @@ cargo build --release
 # Optional flags:
 #   --no-speculate    Disable speculative prefetch for predicted experts
 #   --warm-set        Load warm set at startup (preads frequent experts into page cache)
-#   --kv-quant-bits 3 TurboQuant KV cache (3-bit, ~30% slower)
+#   --kv-quant-bits 3 TurboQuant KV cache (3-bit, default)
 #   --no-kv-quant     Disable KV cache quantization (plain bf16)
 ```
 
@@ -53,7 +55,7 @@ cargo build --release
 
 ### `src/`
 - **main.rs** — CLI (clap): split + generate subcommands. Reads quant config from config.json. Default model: `./split_gemma4`.
-- **config.rs** — `TextModelArgs` with `ModelType` enum (Qwen/Gemma4). Auto-detects from config.json. Handles both naming conventions.
+- **config.rs** — `TextModelArgs` with `ModelType` enum (Qwen/Gemma4). Auto-detects from config.json. `QuantizationConfig` supports per-component bit-width overrides (Unsloth UD format) with `bits_for()`/`group_size_for()` lookups.
 - **model/** — Model/TextModel/DecoderLayer with MoeVariant (Qwen/Gemma4), plus:
   - **attention.rs** — Qwen full attention (output gating, partial RoPE)
   - **gemma4_attention.rs** — Gemma4 attention (no gating, K==V for full-attn, v_norm, scale=1.0, per-layer RoPE/head_dim). `forward_speculative()` for Level C: runs attention with virtual KV append (no cache mutation).
@@ -66,7 +68,7 @@ cargo build --release
 - **perf.rs** — PerfStats: per-phase timing accumulator (routing eval, layer eval, GPU wait, extract, routing CPU)
 - **ffi.rs** — gather_qmm FFI + `array_from_mmap` zero-copy wrapper
 - **ffi_zerocopy.cpp** — C++ shim: MLX array from mmap via Metal `newBufferWithBytesNoCopy`
-- **splitter.rs** — model splitter (original → resident + per-layer expert ECB). Auto-detects Qwen (switch_mlp) vs Gemma4 (experts.gate_up_proj) layout. Unfuses Gemma4 gate_up_proj during ECB writing.
+- **splitter.rs** — model splitter (original → resident + per-layer expert ECB). Auto-detects three layouts: Qwen (switch_mlp), Gemma4 (experts.gate_up_proj, fused), Gemma4Ud (experts.switch_glu, unfused). Canonicalizes resident weight names across prefix conventions.
 - **build.rs** — compiles ffi_zerocopy.cpp with MLX C++ headers
 
 ### I/O strategy (current default, USE_ZEROCOPY=true)
@@ -81,16 +83,17 @@ cargo build --release
 - Architecture: `gemma4` / `gemma4_text`
 - 30 layers, all with MoE + dense MLP in parallel
 - Attention: 24 sliding (head_dim=256, kv_heads=8, rope_theta=10K) + 6 full (global_head_dim=512, kv_heads=2, rope_theta=1M, K==V)
-- Embedding: non-quantized bf16, scaled by √hidden_size. Tied word embeddings via matmul (not quantized_matmul).
+- Embedding: 6-bit quantized (UD) or bf16 (old), scaled by √hidden_size. Tied word embeddings via quantized_matmul (or matmul if bf16).
 - MoE: 128 experts, top_k=8, GELU activation. Router: RMSNormNoScale → scale → proj → per_expert_scale.
 - Dense MLP: GELU, runs in parallel with MoE every layer. Output = dense + expert.
 - Extra norms: pre/post_feedforward_layernorm, pre_feedforward_layernorm_2, post_feedforward_layernorm_{1,2}
 - Layer scalar: per-layer learned scalar applied at end of decoder layer
 - Logit softcapping: tanh(logits/30) × 30
-- **4-bit (group_size=64)**: per_expert_stride ~3.35 MB, ECB file ~428 MB/layer, 8 active = ~26.8 MB/layer
-- Weight naming: `weight_scales`/`weight_biases` (not `scales`/`biases` like Qwen). Handled by `load_qlinear_flex()`.
-- Source: `mlx-community/gemma-4-26b-a4b-it-4bit`
-- Split output: `./split_gemma4` (13 GB)
+- **UD-3bit (current, group_size=64)**: Mixed precision — 3-bit experts (2.6 MB each), 8-bit attention, 3-5 bit dense MLP (varies per layer), 3-bit router, 6-bit embedding. ECB file ~318 MB/layer, 8 active = ~20.8 MB/layer. 5-bit weights re-quantized to 4-bit at load time (MLX has no 5-bit Metal kernel; CPU dequantize → GPU quantize, affects 3 weights on layer 29 only).
+- **Uniform 4-bit (old, group_size=64)**: per_expert_stride ~3.35 MB, ECB file ~428 MB/layer, 8 active = ~26.8 MB/layer.
+- Weight naming: UD uses `scales`/`biases`, mlx-community uses `weight_scales`/`weight_biases`. Handled by `load_qlinear_flex()`.
+- Source: `unsloth/gemma-4-26b-a4b-it-UD-MLX-3bit` (UD-3bit), `mlx-community/gemma-4-26b-a4b-it-4bit` (old)
+- Split output: `./split_gemma4_ud3` (11 GB), `./split_gemma4` (13 GB, old)
 
 #### Qwen 3.5 35B-A3B
 - Architecture: `qwen3_5_moe` mapping to `mlx_lm.models.qwen3_5` (NOT `qwen3_next`)
@@ -103,25 +106,34 @@ cargo build --release
 - Split output: `./split_model_st` (19 GB)
 - Warm set backup: `~/warm_experts_qwen35_35b_a3b.json`
 
-### Per-token I/O comparison (4-bit, top_k=8)
-| Model | Expert size | 8 active/layer | MoE layers | **I/O per token** |
-|-------|------------|----------------|------------|------------------|
-| Gemma4 26B | 3.35 MB | 26.8 MB | 30 | **803 MB** |
-| Qwen 3.5 35B | 1.77 MB | 14.2 MB | 40 | **566 MB** |
+### Per-token I/O comparison (top_k=8)
+| Model | Quant | Expert size | 8 active/layer | MoE layers | **I/O per token** |
+|-------|-------|------------|----------------|------------|------------------|
+| **Gemma4 26B (UD-3bit)** | 3-bit | 2.60 MB | 20.8 MB | 30 | **624 MB** |
+| Gemma4 26B (old 4-bit) | 4-bit | 3.35 MB | 26.8 MB | 30 | 803 MB |
+| Qwen 3.5 35B | 4-bit | 1.77 MB | 14.2 MB | 40 | **566 MB** |
 
-Gemma4 reads 42% more data per token despite fewer layers — experts are ~2× bigger (hidden=2816×704 vs 2048×512).
+UD-3bit reduced Gemma4 expert I/O by 22% (803→624 MB/tok). Smaller experts also fit better in page cache, amplifying the benefit beyond raw I/O reduction.
 
 - 12 CPU threads available (M4)
 
 ## Performance
 
-### Gemma 4 26B-A4B 4-bit (default model, M4 16GB):
-- **80 tokens**: **3.6–3.8 tok/s** (implied 5.1–5.5), peaking at 4.4
-- Decode breakdown (197ms/tok): routing CPU/GCD prefetch 107ms (54%), layer eval+Level C 54ms (27%), routing eval 22ms (11%), extract 14ms (7%)
-- GPU wait: 0.9ms (Level C prediction fills the idle eval window)
+### Gemma 4 26B-A4B UD-3bit (default model, M4 16GB):
+- **256 tokens**: **6.5 tok/s** (implied 7.1), peaking at 8.2
+- **80 tokens**: **6.2 tok/s** (implied 6.7), peaking at 7.4
+- Decode breakdown (142ms/tok @256): routing CPU 36ms (25%), layer eval 57ms (40%), routing eval 30ms (21%), extract 19ms (13%)
+- GPU wait: 0.9ms (speculative prediction fills the idle eval window)
+- I/O-bound: 624 MB/token (3-bit experts are 2.60 MB each)
+- Level B prediction: **71.4% overall** (top-12). Per-layer range: 51% (layer 9) to 89% (layer 28).
+- Resident weights: 1.90 GB (smaller than old 4-bit's 3.56 GB, freeing RAM for page cache)
+
+### Gemma 4 26B-A4B uniform 4-bit (old, M4 16GB):
+- **80 tokens**: **3.1 tok/s** (implied 4.1), peaking at 3.4
+- Decode breakdown (243ms/tok): routing CPU 147ms (61%), layer eval 57ms (23%), routing eval 24ms (10%), extract 16ms (6%)
 - I/O-bound: 803 MB/token (experts are 3.35 MB each, 2× bigger than Qwen)
-- Level C prediction: **73% overall** (53%–90% per-layer). Dense MLP + speculative attention + next-layer router on h_post_attn. Replaces co-occurrence (50.5%).
-- Theoretical max at current cache hit (~67%): 5.1 tok/s. At 90% cache (long gen): ~8 tok/s. GPU-bound ceiling: ~11 tok/s.
+- Level C prediction: **73% overall** (53%–90% per-layer). Dense MLP + speculative attention + next-layer router on h_post_attn.
+- **UD-3bit is 2× faster**: 22% less I/O + 47% less resident RAM = 70% less routing CPU time.
 
 ### Qwen 3.5 35B-A3B 4-bit (M4 16GB):
 - **50 tokens**: **7.7 tok/s** (implied 8.1), peaking at 8.7
@@ -148,7 +160,8 @@ Gemma4 reads 42% more data per token despite fewer layers — experts are ~2× b
 - Pages touched by speculative before cancellation remain in page cache, reducing reactive's work.
 - Without cancel: 6.3 tok/s (SSD contention). With cancel: 7.7 tok/s (clean handoff) for Qwen.
 - GCD QoS (utility vs userInitiated) provides OS-level thread priority differentiation.
-- **Gemma4 speculative with Level C prediction**: 3.6–3.8 tok/s, matching no-speculation baseline (speculation adds zero overhead after prefault-only fix).
+- **Gemma4 UD-3bit speculative**: 6.5 tok/s @256 tokens with TurboQuant. Speculation adds zero overhead after prefault-only fix.
+- **Gemma4 old 4-bit speculative with Level C prediction**: 3.6–3.8 tok/s (historical).
 
 ### Why pread-based speculative failed on 4-bit (historical)
 - Experts are 1.69 MB (small) — page cache retains them between tokens
@@ -169,15 +182,18 @@ Gemma4 reads 42% more data per token despite fewer layers — experts are ~2× b
 
 ### Expert prediction:
 - **Qwen** (measured 2026-03-30): **Pre-MoE + next LN, top-12**: 84-86% accuracy. Per-layer range: 57% (layer 1) to 96% (layer 34). Uses co-occurrence table.
-- **Gemma4** (measured 2026-04-04): **Level C prediction: 73% overall** (top-12). Per-layer range: 53% (layer 7) to 90% (layer 26). Three prediction tiers:
-  - **Level C** (default, Gemma4): dense MLP + speculative attention (virtual KV append, no cache mutation) + next-layer router. ~0.6ms/layer GPU, runs lazily between async_eval/eval. Works with both plain and TurboQuant KV cache.
+- **Gemma4 UD-3bit** (measured 2026-04-05): **Level B prediction: 71.4% overall** (top-12). Per-layer range: 51% (layer 9) to 89% (layer 28).
+- **Gemma4 old 4-bit** (measured 2026-04-04): **Level C prediction: 73% overall** (top-12). Per-layer range: 53% (layer 7) to 90% (layer 26).
+- Three prediction tiers:
+  - **Level C** (Gemma4): dense MLP + speculative attention (virtual KV append, no cache mutation) + next-layer router. ~0.6ms/layer GPU, runs lazily between async_eval/eval. Works with both plain and TurboQuant KV cache.
   - **Level A.5** (fallback): dense MLP + next-layer router (skip attention). ~0 extra cost (fills GPU idle time).
-  - **Level B** (Qwen fallback): CPU dequantized matmul of next-layer router on h_post_attn. ~0.1ms/layer, zero GPU impact. Pre-converted f32 weights in `RouterWeightsRef`.
+  - **Level B** (Qwen, Gemma4 fallback): CPU dequantized matmul of next-layer router on h_post_attn. ~0.1ms/layer, zero GPU impact. Pre-converted f32 weights in `RouterWeightsRef`.
 - Old co-occurrence baseline for Gemma4 was 50.5% (still used as fallback for Qwen)
 
 ## Key gotchas
 
 ### MLX / mlx-rs
+- **MLX Metal quantized_matmul/gather_qmm supports only {2, 3, 4, 6, 8}-bit**. Unsloth UD uses 5-bit for some dense MLP layers — `load_qlinear_flex()` auto-detects unsupported bit widths and re-quantizes at load time (CPU dequantize → GPU quantize to nearest supported). Currently only affects 3 weights on layer 29.
 - `mlx_array_new_data` (and `Array::from_raw_data`) **copies** data — use `ffi_zerocopy.cpp` shim for zero-copy via `newBufferWithBytesNoCopy`
 - `Array::load_safetensors()` creates lazy arrays; loading all expert files causes swap storms on 16 GB
 - `gather_qmm` is NOT in mlx-rs — use `mlx_sys::mlx_gather_qmm` via FFI wrapper
@@ -211,9 +227,9 @@ Gemma4 reads 42% more data per token despite fewer layers — experts are ~2× b
 - `NOREACTIVE=1` — skip reactive blocking pread (for A/B testing)
 
 ### Speculative prefetch methods tested:
-- **GCD prefault-only + Level C prediction (current, Gemma4)**: fire-and-forget prefault on utility queue, cancel via atomic. Level C (dense MLP + speculative attention + next router) predicts at 73%. Speculative adds zero overhead. **Net neutral** (prediction warms cache, prefault-only avoids contention).
+- **GCD prefault-only + prediction (current, Gemma4)**: fire-and-forget prefault on utility queue, cancel via atomic. Level B/C prediction at 71-73%. Speculative adds zero overhead. **Net neutral to positive** (prediction warms cache, prefault-only avoids contention).
 - **GCD cancellable prefault + co-occurrence (current, Qwen)**: fire-and-forget on utility queue, cancel via atomic when reactive starts. **Net positive** (+0.8 tok/s). The only method that avoids SSD contention.
-- **F_RDADVISE + madvise in speculative (old, removed)**: kernel-level I/O hints can't be cancelled once issued. Causes SSD contention with reactive. **Net negative** on Gemma4 (2.7 vs 3.7 tok/s without speculation).
+- **F_RDADVISE + madvise in speculative (old, removed)**: kernel-level I/O hints can't be cancelled once issued. Causes SSD contention with reactive. **Net negative** on old Gemma4 4-bit (2.7 vs 3.7 tok/s without speculation).
 - **F_RDADVISE only**: lightest (fcntl hint, ~0.5ms/tok). SSD contention with reactive. Net negative.
 - **Main-thread pread**: perfect GPU overlap (wait=1ms) but 2.8ms/layer blocks pipeline. Net negative.
 - **Background rayon pool (4-thread)**: 2.3× background-thread penalty on macOS. Net negative.
